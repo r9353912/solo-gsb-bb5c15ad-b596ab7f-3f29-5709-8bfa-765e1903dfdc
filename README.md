@@ -205,6 +205,36 @@
 7. **演员只可查看自己当前参与的有效时段的道具清单**（仅道具名称与本时段件数，不见库存、余量与其他预约）；
    非参与时段、待调整/已取消时段、登记册与任何写入接口均 `403`。演员与导演的日程列表均带 `props` 简表。
 
+### 道具领用与归还（实物领用 / 分批归还 / 损坏核销）
+
+1. 导演可从**有效（`active`）时段**的预约中办理**实物领用**
+   （`POST /api/rehearsals/:id/schedules/:sid/prop-checkouts`）：指定**该时段当前参与演员**
+   （含生效临时替角）为**保管人**，一张领用单可含多个道具，**整次生效或整次不生效**：
+   - **各道具在本时段的累计领用量不得超过该时段预约量**（`409 PROP_CHECKOUT_EXCEEDS_RESERVATION`，
+     `details.exceeds` 逐道具给出预约量/已领/本次/可领）；
+   - **跨时段未归还总量**（领用 − 完好归还 − 损坏核销）**不得超过道具现有库存**
+     （`409 PROP_STOCK_INSUFFICIENT`，`details.insufficient` 给出库存/未归还/本次/可申请）；
+   - 已取消与待调整时段不能办理领用（`400`）；保管人不是该时段当前参与演员、未知道具、
+     无效件数、同批重复道具等一律 `400` 明确拒绝。
+2. **幂等请求号**：领用请求必须携带全局唯一的 `requestId`。**同号同内容**重试返回首次结果
+   （`200`，`idempotentReplay: true`，不产生新单；明细顺序差异视为同内容）；
+   **同号异内容**拒绝（`409 REQUEST_ID_CONFLICT`）。
+3. **分批归还**：导演按原领用记录分批登记**完好归还**（`good`）与**损坏**（`damaged`）件数
+   （`POST /api/prop-checkouts/:id/returns`，一批可含该单多个道具）；
+   同一（领用单 × 道具）的**累计归还（完好 + 损坏）不得超过未归还量**
+   （`409 PROP_RETURN_EXCEEDS_OUTSTANDING`）；归还道具不在原单中、`good+damaged=0` 的空登记等一律 `400`。
+4. **损坏核销**：损坏件数随即**扣减道具总库存**（`props.total_count`）。扣减后若既有**有效预约**超量，
+   **保留预约并显示缺口**——归还响应的 `shortages` 与 `GET /api/props/shortages` 均给出
+   道具/峰值时刻/库存/峰值占用/缺口/冲突时段；**后续预约和调期按新库存校验**
+   （`409 PROP_CAPACITY_CONFLICT`）。此外，下调道具总量不得低于跨时段未归还领用总量
+   （`409 PROP_STOCK_INSUFFICIENT`）。
+5. **流水不可抹除**：时段**取消、转待调整、改派或换版**均不抹除领还流水与**原保管人的未归还责任**
+   （保管人在办理时冻结于领用单）；领还流水只增不改。
+6. **可见性**：导演查看**库存缺口**（`GET /api/props/shortages`）与**责任清单**
+   （`GET /api/prop-checkouts`，`?status=outstanding|cleared` 可过滤，含各道具未归还量与保管人；
+   登记册与时段预约视图附带未归还/领用进度）；演员**仅查看本人领还流水**
+   （`GET /api/me/prop-checkouts`），其余领还接口一律 `403`。
+
 ## 一键启动（Docker，推荐）
 
 前置：已安装 Docker 与 Docker Compose v2。
@@ -347,6 +377,13 @@ PORT=8080 docker compose up --build -d
 | PATCH | `/api/props/:propId` | 调整道具总量/改名（导演；下调时校验全部有效预约，不足整次不生效） |
 | GET/PUT | `/api/rehearsals/:id/schedules/:sid/props` | 查看时段预约与最低余量（演员仅限本人参与的有效时段且只见清单）/ 填写道具目标件数（导演；`quantity=0` 撤销，未列出的道具不变） |
 | POST | `/api/schedules/props/batch` | 批量修改多个时段的道具预约（导演，至少两条，可跨排练）：整批最终状态校验，任一时刻不足整批不生效，返回道具/冲突时段/缺口 |
+| GET | `/api/props/shortages` | 库存缺口清单（导演）：损坏核销扣减总库存后，既有有效预约超量的道具（预约保留，含峰值时刻/缺口/冲突时段） |
+| POST | `/api/rehearsals/:id/schedules/:sid/prop-checkouts` | 办理道具领用（导演，仅有效时段）：指定该时段当前参与演员为保管人；本时段累计领用≤预约量、跨时段未归还≤现有库存，任一不合格整次不生效；幂等 `requestId`（同号同内容重试返回原结果，同号异内容 409） |
+| GET | `/api/rehearsals/:id/schedules/:sid/prop-checkouts` | 该时段的领用记录（导演；含各道具领用/已还/未还量） |
+| GET | `/api/prop-checkouts` | 领用责任清单（导演；`?status=outstanding|cleared` 过滤）：保管人、时段（含已取消/待调整实时状态）、各道具未归还量 |
+| GET | `/api/prop-checkouts/:id` | 领用单详情（导演；含完整归还流水） |
+| POST | `/api/prop-checkouts/:id/returns` | 分批登记归还（导演）：完好+损坏件数，累计≤未归还量；损坏扣减总库存，响应含库存缺口 |
+| GET | `/api/me/prop-checkouts` | 演员查看本人领还流水（仅自己作为保管人的领用单及归还记录） |
 | GET | `/api/actor-rates` | 演员每小时费率表（仅导演；未设置为 `null`，显式 0 与未设置区分） |
 | PUT | `/api/actors/:actorId/rate` | 设置演员费率（导演；`rateCentsPerHour` 非负整数，单位 分/小时） |
 | GET | `/api/me/rate` | 演员查看本人当前费率 |
@@ -360,6 +397,8 @@ PORT=8080 docker compose up --build -d
 典型状态码：`400`（无效版本/场次/参数、状态不允许的操作）、`401`（未登录）、`403`（越权）、`404`（不存在）、
 `409`（业务冲突，如 `OLD_TEXT_MISMATCH`、`PUBLISH_CONFLICT`、`SCHEDULE_CONFLICT`、
 `UNAVAILABILITY_CONFLICT`、`ATTENDANCE_EXISTS`、`ATTENDANCE_NOT_OPEN`、`NOTIFICATION_EXPIRED`、`PREVIEW_STALE`、`PROP_CAPACITY_CONFLICT`、`ATTENDANCE_FROZEN`、
+`PROP_CHECKOUT_EXCEEDS_RESERVATION`（领用超本时段预约量）、`PROP_STOCK_INSUFFICIENT`（跨时段未归还超现有库存/下调库存低于未归还量）、
+`PROP_RETURN_EXCEEDS_OUTSTANDING`（归还合计超未归还量）、`REQUEST_ID_CONFLICT`（同号异内容）、
 `SETTLEMENT_DUPLICATE_SESSION`（400，整单重复选择登记）、`SETTLEMENT_SESSION_ALREADY_SETTLED`（409，登记已结算）；
 无费率/未关闭/已作废等结算入参问题为 `400 BAD_REQUEST`，`details.code` 分别为
 `SETTLEMENT_RATE_MISSING` / `SETTLEMENT_SESSION_NOT_CLOSED` / `SETTLEMENT_VOIDED_SESSION` / `SETTLEMENT_DUPLICATE_SESSION`，任何拒绝均不占用登记）。
@@ -825,6 +864,105 @@ curl -s http://localhost:3000/api/rehearsals/1/schedules/2/props \
 #        "props":[{"propId":1,"propName":"煤油灯","quantity":2}]}
 ```
 
+## 道具领用与归还接口调用示例（curl）
+
+```bash
+# 1. 导演登录，拿到 token
+curl -s -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"director","password":"director123"}'
+# -> {"token":"<TOKEN>",...}
+
+# 2. 办理领用：从有效时段 1 的预约中领出实物，指定该时段当前参与演员（林晚 id=2）为保管人；
+#    必须携带全局唯一请求号 requestId
+curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules/1/prop-checkouts \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"requestId":"CHK-20261006-001","custodianActorId":2,"note":"首演联排领用",
+       "items":[{"propId":1,"quantity":1},{"propId":2,"quantity":1}]}'
+# -> 201 {"ok":true,"idempotentReplay":false,
+#        "checkout":{"id":1,"requestId":"CHK-20261006-001",
+#          "schedule":{"id":1,"rehearsalId":1,"rehearsalName":"首演排练（固定 v1）",
+#            "sceneTitle":"I 风暴前夜","startAt":"...","endAt":"...","status":"active"},
+#          "custodian":{"actorId":2,"actorName":"林晚","actorUsername":"lin"},
+#          "items":[{"propId":1,"propName":"煤油灯","quantity":1,
+#                    "returnedGood":0,"returnedDamaged":0,"outstanding":1},
+#                   {"propId":2,"propName":"道具佩剑","quantity":1,
+#                    "returnedGood":0,"returnedDamaged":0,"outstanding":1}],
+#          "totalQuantity":2,"totalOutstanding":2,"status":"outstanding","returns":[]}}
+#    校验（任一不合格整次不生效）：
+#    - 各道具本时段累计领用量 ≤ 本时段预约量
+#      -> 409 {"error":"PROP_CHECKOUT_EXCEEDS_RESERVATION",
+#              "details":{"exceeds":[{"propId":1,"reserved":1,"alreadyCheckedOut":1,
+#                                     "requested":1,"available":0,...}]}}
+#    - 跨时段未归还总量 ≤ 道具现有库存
+#      -> 409 {"error":"PROP_STOCK_INSUFFICIENT",
+#              "details":{"insufficient":[{"propId":1,"totalCount":2,"unreturned":2,
+#                                          "requested":1,"available":0,...}]}}
+#    - 已取消/待调整时段、保管人非该时段当前参与演员、未知道具/无效件数/重复道具 -> 400
+
+# 3. 幂等：同号同内容重试 -> 200 返回首次结果（不产生新单）；同号异内容 -> 409
+curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules/1/prop-checkouts \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"requestId":"CHK-20261006-001","custodianActorId":2,"note":"首演联排领用",
+       "items":[{"propId":1,"quantity":1},{"propId":2,"quantity":1}]}'
+# -> 200 {"ok":true,"idempotentReplay":true,"checkout":{"id":1, ...同首次...}}
+curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules/1/prop-checkouts \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"requestId":"CHK-20261006-001","custodianActorId":2,"items":[{"propId":1,"quantity":2}]}'
+# -> 409 {"error":"REQUEST_ID_CONFLICT",
+#        "message":"请求号「CHK-20261006-001」已被不同内容的领用请求使用，本次请求被拒绝"}
+
+# 4. 分批归还：按原领用记录登记完好/损坏件数（累计不得超过未归还量）
+curl -s -X POST http://localhost:3000/api/prop-checkouts/1/returns \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"items":[{"propId":1,"good":1},{"propId":2,"damaged":1}],"note":"联排结束归还"}'
+# -> 201 {"ok":true,
+#        "returns":[{"id":1,"propId":1,"propName":"煤油灯","goodQuantity":1,"damagedQuantity":0,...},
+#                   {"id":2,"propId":2,"propName":"道具佩剑","goodQuantity":0,"damagedQuantity":1,...}],
+#        "checkout":{"id":1,"status":"cleared","totalOutstanding":0,
+#          "items":[{"propId":1,"returnedGood":1,"outstanding":0,...},
+#                   {"propId":2,"returnedDamaged":1,"outstanding":0,...}], ...},
+#        "shortages":[{"propId":2,"propName":"道具佩剑","totalCount":0,
+#          "peakAt":"2026-10-10T06:00:00.000Z","peakReserved":1,"shortage":1,
+#          "schedules":[{"id":1,"rehearsalId":1,"quantity":1,...}]}]}
+#    损坏件数随即扣减道具总库存（道具佩剑 1 -> 0）；扣减后既有有效预约超量时
+#    预约保留，shortages 列出缺口（道具/峰值时刻/库存/峰值占用/缺口/冲突时段），
+#    后续预约与调期按新库存校验（409 PROP_CAPACITY_CONFLICT）。
+#    归还超未归还量 -> 409 PROP_RETURN_EXCEEDS_OUTSTANDING；
+#    归还道具不在原单中、good+damaged=0 -> 400。
+
+# 5. 导演查看库存缺口与责任清单
+curl -s http://localhost:3000/api/props/shortages -H "Authorization: Bearer <TOKEN>"
+# -> {"shortages":[{"propId":2,"propName":"道具佩剑","totalCount":0,"peakReserved":1,
+#      "shortage":1,"peakAt":"...","schedules":[...]}]}
+curl -s "http://localhost:3000/api/prop-checkouts?status=outstanding" -H "Authorization: Bearer <TOKEN>"
+# -> {"checkouts":[{"id":1,"requestId":"CHK-20261006-001",
+#      "custodian":{"actorId":2,"actorName":"林晚"},
+#      "schedule":{"id":1,"status":"cancelled", ...},   <- 时段取消/待调整/改派/换版均不抹除流水与责任
+#      "items":[{"propId":1,"propName":"煤油灯","outstanding":1,...}],
+#      "totalOutstanding":1,"status":"outstanding"}, ...]}
+curl -s http://localhost:3000/api/prop-checkouts/1 -H "Authorization: Bearer <TOKEN>"   # 详情含归还流水
+curl -s http://localhost:3000/api/rehearsals/1/schedules/1/prop-checkouts \
+  -H "Authorization: Bearer <TOKEN>"                                                    # 按时段查看
+curl -s http://localhost:3000/api/props -H "Authorization: Bearer <TOKEN>"
+# -> 登记册每道具附 unreturnedCheckouts（跨时段未归还量）与 shortage（当前缺口）
+
+# 6. 演员仅查看本人领还流水（其余领还接口一律 403）
+curl -s http://localhost:3000/api/me/prop-checkouts -H "Authorization: Bearer <ACTOR_TOKEN>"
+# -> {"checkouts":[{"id":1,"custodian":{"actorId":2,"actorName":"林晚"},
+#      "items":[{"propId":1,"propName":"煤油灯","outstanding":0,...}],
+#      "returns":[{"propId":1,"goodQuantity":1,...}, ...], ...}]}
+
+# 7. 下调道具总量不得低于跨时段未归还领用总量
+curl -s -X PATCH http://localhost:3000/api/props/1 \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"totalCount":0}'
+# -> 409 {"error":"PROP_STOCK_INSUFFICIENT",
+#        "message":"下调后道具库存低于跨时段未归还领用总量，本次调整未生效",
+#        "details":{"insufficient":[{"propId":1,"totalCount":0,"unreturned":1,"shortage":1}]}}
+```
+
+
 ## 临时替角接口调用示例（curl）
 
 ```bash
@@ -1032,6 +1170,10 @@ curl -s http://localhost:3000/api/settlements -H "Authorization: Bearer <ACTOR_T
 共享道具（登记/改名/调总量与下调校验、单条与跨排练批量预约、无效件数/未知道具时段/同批重复组合拒绝、
 半开区间与端点相接、撤销(0)与未列出项不变、整批最终状态校验与回滚、调期与批量调期携带预约移动超占整体不生效、
 取消/转待调整释放占用、恢复有效重新校验、演员仅见本人参与有效时段清单且越权 403、日程列表 props 简表）、
+道具领用与归还（有效时段领用与保管人校验、本时段预约量与跨时段未归还库存双上限整次拒绝、
+幂等请求号同号同内容重放/同号异内容拒绝、分批归还与超未归还量拒绝、损坏核销扣减总库存、
+核销后预约超量保留并显示缺口且后续预约/调期按新库存校验、取消/改派/换版不抹除流水与责任、
+下调库存不得低于未归还量、演员仅见本人领还流水）、
 临时替角（设置/替换/撤回与最终参与者返回；无效时段/角色/非演员/本人替补/缺原因拒绝；同角色同时段一个替角；
 只改本时段参与者/通知接收人/替角本场台词而不改常驻派角与逐场确认、权限不外延；
 设置/撤回按最终名单检查时段与本人不可用重叠、端点相接、冲突整体不生效；改派/调期/取消/换版后失去台词或原派角变化即失效并重校验、
@@ -1064,8 +1206,12 @@ src/
   attendance.js    到场登记（开启冻结名单/缺口、本人签到、关闭记缺席、作废与统计）
   unavailability.js 演员不可用时段（登记/修改/撤销/本人查看，与本人有效日程重叠即整次拒绝）
   notifications.js 时段通知（知悉确认）：导演查看批次名单与历史、演员本人批次列表与幂等确认
-  props.js         剧团共享道具：登记册与总量调整、时段预约（单条/批量，半开区间库存扫描线）、
-                   容量冲突（道具/冲突时段/缺口）、调期集成校验、演员可见性
+  props.js         剧团共享道具：登记册与总量调整（下调不得低于未归还领用量）、时段预约（单条/批量，
+                   半开区间库存扫描线）、容量冲突（道具/冲突时段/缺口）、调期集成校验、
+                   库存缺口清单、时段领用进度、演员可见性
+  prop-checkouts.js 道具领用与归还：有效时段实物领用（保管人=当前参与演员，预约量/未归还库存双上限，
+                   幂等请求号同号同内容重放/同号异内容拒绝）、分批归还（完好+损坏，损坏核销扣减总库存，
+                   核销后缺口随响应返回）、责任清单与演员本人流水；流水只增不改
   substitutes.js   单时段临时替角：设置/替换/撤回（签到开启前）、最终参与者返回、替角本场台词；
                    失效与重校验由 schedules.js/rehearsals.js 在调期/改派/换版/取消事务内完成
   settlements.js   演员劳务结算：费率维护（分/小时非负整数）、可结算登记清单、只读预演、

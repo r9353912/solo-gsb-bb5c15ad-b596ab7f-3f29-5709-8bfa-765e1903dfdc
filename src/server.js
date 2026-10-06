@@ -12,6 +12,7 @@ const { router: attendanceRouter } = require('./attendance');
 const { router: unavailabilityRouter } = require('./unavailability');
 const { router: notificationsRouter } = require('./notifications');
 const { router: propsRouter } = require('./props');
+const { router: propCheckoutsRouter } = require('./prop-checkouts');
 const { router: substitutesRouter } = require('./substitutes');
 const { router: settlementsRouter } = require('./settlements');
 const { db } = require('./db');
@@ -46,6 +47,7 @@ app.use('/api', attendanceRouter);
 app.use('/api', unavailabilityRouter);
 app.use('/api', notificationsRouter);
 app.use('/api', propsRouter);
+app.use('/api', propCheckoutsRouter);
 app.use('/api', substitutesRouter);
 app.use('/api', settlementsRouter);
 

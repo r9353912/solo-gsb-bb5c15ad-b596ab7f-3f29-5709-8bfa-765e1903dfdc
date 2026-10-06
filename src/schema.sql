@@ -376,6 +376,55 @@ CREATE TABLE IF NOT EXISTS prop_reservations (
 CREATE INDEX IF NOT EXISTS idx_prop_reservations_prop ON prop_reservations(prop_id);
 CREATE INDEX IF NOT EXISTS idx_prop_reservations_schedule ON prop_reservations(schedule_id);
 
+-- 道具领用单：导演从“有效（active）时段”的预约中办理实物领用，指定该时段当前参与演员为保管人。
+--   * request_id 为幂等请求号（全局唯一）：同号同内容重试返回首次结果；同号异内容拒绝（409）。
+--     request_hash 为请求内容指纹（排练/时段/保管人/明细/备注归一化后的 SHA-256）。
+--   * 各道具“本时段累计领用量”不得超过该时段预约量；跨时段“未归还总量”
+--     （领用 − 完好归还 − 损坏核销）不得超过道具现有库存；任一项不合格整次不生效。
+--   * 保管人在办理时冻结（custodian_actor_id）：之后的取消/转待调整/改派/换版均不改写
+--     领还流水，原保管人的未归还责任保留。
+CREATE TABLE IF NOT EXISTS prop_checkouts (
+  id                 INTEGER PRIMARY KEY,
+  request_id         TEXT NOT NULL UNIQUE,
+  request_hash       TEXT NOT NULL,
+  schedule_id        INTEGER NOT NULL REFERENCES rehearsal_schedules(id) ON DELETE CASCADE,
+  rehearsal_id       INTEGER NOT NULL REFERENCES rehearsals(id) ON DELETE CASCADE,
+  custodian_actor_id INTEGER NOT NULL REFERENCES users(id),
+  note               TEXT NOT NULL DEFAULT '',
+  created_by         INTEGER REFERENCES users(id),
+  created_at         TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_prop_checkouts_schedule ON prop_checkouts(schedule_id);
+CREATE INDEX IF NOT EXISTS idx_prop_checkouts_custodian ON prop_checkouts(custodian_actor_id);
+
+-- 领用明细：一张领用单可含多个道具（整次生效/整次不生效）；一单对一道具至多一行。
+CREATE TABLE IF NOT EXISTS prop_checkout_items (
+  id          INTEGER PRIMARY KEY,
+  checkout_id INTEGER NOT NULL REFERENCES prop_checkouts(id) ON DELETE CASCADE,
+  prop_id     INTEGER NOT NULL REFERENCES props(id),
+  quantity    INTEGER NOT NULL CHECK (quantity > 0),
+  UNIQUE (checkout_id, prop_id)
+);
+CREATE INDEX IF NOT EXISTS idx_prop_checkout_items_prop ON prop_checkout_items(prop_id);
+
+-- 道具归还流水：按原领用记录分批登记“完好归还”与“损坏”件数（只增不改）。
+--   * 同一（领用单 × 道具）的累计归还（完好 + 损坏）不得超过该明细的未归还量；
+--   * 损坏件数随即扣减 props.total_count（总库存）；扣减后既有有效预约超量时
+--     保留预约并显示缺口，后续预约与调期按新库存校验；
+--   * 取消/转待调整/改派/换版均不抹除本流水。
+CREATE TABLE IF NOT EXISTS prop_returns (
+  id               INTEGER PRIMARY KEY,
+  checkout_id      INTEGER NOT NULL REFERENCES prop_checkouts(id) ON DELETE CASCADE,
+  prop_id          INTEGER NOT NULL REFERENCES props(id),
+  good_quantity    INTEGER NOT NULL CHECK (good_quantity >= 0),
+  damaged_quantity INTEGER NOT NULL CHECK (damaged_quantity >= 0),
+  note             TEXT NOT NULL DEFAULT '',
+  created_by       INTEGER REFERENCES users(id),
+  created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_prop_returns_checkout ON prop_returns(checkout_id);
+CREATE INDEX IF NOT EXISTS idx_prop_returns_prop ON prop_returns(prop_id);
+
 -- 演员每小时劳务费率（导演维护，非负整数，单位：分/小时）。
 --   * 仅演员有费率；没有行 = 未设置费率（结算时整单拒绝），显式 0 = 费率为零，可正常结算为 0 元。
 --   * 费率可随时调整；结算单冻结的是“结算时费率”（settlement_entries.rate_cents_per_hour），

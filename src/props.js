@@ -16,6 +16,11 @@ const { authRequired } = require('./auth');
  *
  * 可见性：演员只可查看自己当前参与的有效时段的道具清单，不能读取其他预约。
  *
+ * 实物领用/归还（路由见 prop-checkouts.js）与本模块的关系：
+ *   - 下调总量时除有效预约校验外，还不得低于“跨时段未归还领用总量”（409 PROP_STOCK_INSUFFICIENT）；
+ *   - 损坏归还扣减总库存后，既有有效预约可能超量：预约保留，经 GET /props/shortages 展示缺口；
+ *   - 导演时段预约视图附带本时段领用进度（checkedOut/returnedGood/returnedDamaged/outstanding）。
+ *
  * 依赖方向：本模块不引用 schedules.js（避免循环依赖）；schedules.js 在顶部引入本模块的
  * assertPropsAfterScheduleChange，于单条/批量调期事务内做库存校验。
  */
@@ -145,6 +150,31 @@ function peakOverlap(rows) {
   return best;
 }
 
+/** 单个道具的缺口条目（409 详情、缺口清单与归还响应共用同一形状） */
+function shortageEntry(prop, total, peak) {
+  return {
+    propId: prop.id,
+    propName: prop.name,
+    totalCount: total,
+    peakAt: new Date(peak.at).toISOString(),
+    shortage: peak.peak - total,
+    peakReserved: peak.peak,
+    schedules: peak.rows.map((row) => ({
+      id: row.schedule_id,
+      rehearsalId: row.rehearsal_id,
+      rehearsalName: row.rehearsal_name,
+      sceneId: row.scene_id,
+      sceneTitle: (() => {
+        const scene = db.prepare('SELECT code, title FROM scenes WHERE id = ?').get(row.scene_id);
+        return scene ? `${scene.code} ${scene.title}` : null;
+      })(),
+      startAt: row.start_at,
+      endAt: row.end_at,
+      quantity: row.quantity,
+    })),
+  };
+}
+
 /**
  * 按数据库中的“最终状态”校验全部道具库存容量（调用方须先把预约/调期在事务内落库）。
  *   - overrides: Map<propId, totalCount> 可临时覆盖库存（下调库存校验时用）。
@@ -155,33 +185,77 @@ function assertPropCapacity({ overrides = null, message = '共享道具库存不
   const shortages = [];
   for (const prop of props) {
     const total = overrides?.has(prop.id) ? overrides.get(prop.id) : prop.total_count;
-    const rows = activeReservationsForProp(prop.id);
-    const peak = peakOverlap(rows);
+    const peak = peakOverlap(activeReservationsForProp(prop.id));
     if (peak.at != null && peak.peak > total) {
-      shortages.push({
-        propId: prop.id,
-        propName: prop.name,
-        totalCount: total,
-        peakAt: new Date(peak.at).toISOString(),
-        shortage: peak.peak - total,
-        peakReserved: peak.peak,
-        schedules: peak.rows.map((row) => ({
-          id: row.schedule_id,
-          rehearsalId: row.rehearsal_id,
-          rehearsalName: row.rehearsal_name,
-          sceneId: row.scene_id,
-          sceneTitle: (() => {
-            const scene = db.prepare('SELECT code, title FROM scenes WHERE id = ?').get(row.scene_id);
-            return scene ? `${scene.code} ${scene.title}` : null;
-          })(),
-          startAt: row.start_at,
-          endAt: row.end_at,
-          quantity: row.quantity,
-        })),
-      });
+      shortages.push(shortageEntry(prop, total, peak));
     }
   }
   if (shortages.length) throw conflict('PROP_CAPACITY_CONFLICT', message, { shortages });
+}
+
+/**
+ * 当前全部“有效预约峰值超过现有库存”的道具缺口（损坏核销扣减总库存后可能出现）：
+ * 预约保留不撤销，缺口在此展示；后续预约与调期仍按新库存校验（assertPropCapacity）。
+ */
+function computePropShortages() {
+  const props = db.prepare('SELECT * FROM props ORDER BY id').all();
+  const shortages = [];
+  for (const prop of props) {
+    const peak = peakOverlap(activeReservationsForProp(prop.id));
+    if (peak.at != null && peak.peak > prop.total_count) {
+      shortages.push(shortageEntry(prop, prop.total_count, peak));
+    }
+  }
+  return shortages;
+}
+
+/**
+ * 各道具“跨时段未归还领用总量”：Σ领用 − Σ(完好归还 + 损坏核销)。
+ * 与时段状态无关——实物未归即计入（取消/转待调整/改派/换版均不免除原保管人责任）。
+ */
+function unreturnedCheckoutTotals() {
+  const totals = new Map();
+  for (const r of db.prepare('SELECT prop_id, SUM(quantity) AS q FROM prop_checkout_items GROUP BY prop_id').all()) {
+    totals.set(r.prop_id, r.q);
+  }
+  for (const r of db
+    .prepare('SELECT prop_id, SUM(good_quantity + damaged_quantity) AS q FROM prop_returns GROUP BY prop_id')
+    .all()) {
+    totals.set(r.prop_id, (totals.get(r.prop_id) || 0) - r.q);
+  }
+  return totals;
+}
+
+/** 某时段各道具的领用进度（导演视图）：本时段累计领用 / 完好归还 / 损坏核销 / 未归还 */
+function scheduleCheckoutProgress(scheduleId) {
+  const map = new Map();
+  const outs = db
+    .prepare(
+      `SELECT ci.prop_id, SUM(ci.quantity) AS q
+         FROM prop_checkout_items ci
+         JOIN prop_checkouts co ON co.id = ci.checkout_id
+        WHERE co.schedule_id = ?
+        GROUP BY ci.prop_id`
+    )
+    .all(scheduleId);
+  const rets = db
+    .prepare(
+      `SELECT r.prop_id, SUM(r.good_quantity) AS good, SUM(r.damaged_quantity) AS damaged
+         FROM prop_returns r
+         JOIN prop_checkouts co ON co.id = r.checkout_id
+        WHERE co.schedule_id = ?
+        GROUP BY r.prop_id`
+    )
+    .all(scheduleId);
+  for (const r of outs) map.set(r.prop_id, { checkedOut: r.q, returnedGood: 0, returnedDamaged: 0 });
+  for (const r of rets) {
+    const cur = map.get(r.prop_id) || { checkedOut: 0, returnedGood: 0, returnedDamaged: 0 };
+    cur.returnedGood = r.good || 0;
+    cur.returnedDamaged = r.damaged || 0;
+    map.set(r.prop_id, cur);
+  }
+  for (const v of map.values()) v.outstanding = v.checkedOut - v.returnedGood - v.returnedDamaged;
+  return map;
 }
 
 /**
@@ -199,6 +273,7 @@ function slotPropView(s) {
         ORDER BY p.id`
     )
     .all(s.id);
+  const checkoutProgress = scheduleCheckoutProgress(s.id);
   const slotStart = Date.parse(s.start_at);
   const slotEnd = Date.parse(s.end_at);
   const items = reservations.map((r) => {
@@ -220,6 +295,7 @@ function slotPropView(s) {
         if (cur > peak) peak = cur;
       }
     }
+    const prog = checkoutProgress.get(r.prop_id) || { checkedOut: 0, returnedGood: 0, returnedDamaged: 0, outstanding: 0 };
     return {
       propId: r.prop_id,
       propName: r.prop_name,
@@ -228,6 +304,10 @@ function slotPropView(s) {
       occupying: s.status === 'active',
       peakReservedInSlot: peak,
       minRemaining: s.status === 'active' ? r.total_count - peak : null,
+      checkedOut: prog.checkedOut,
+      returnedGood: prog.returnedGood,
+      returnedDamaged: prog.returnedDamaged,
+      outstanding: prog.outstanding,
       updatedAt: r.updated_at ?? r.created_at,
     };
   });
@@ -270,6 +350,7 @@ function serializeProp(p) {
         WHERE pr.prop_id = ? AND s.status = 'active' AND pr.quantity > 0`
     )
     .get(p.id).n;
+  const unreturned = unreturnedCheckoutTotals().get(p.id) || 0;
   return {
     id: p.id,
     name: p.name,
@@ -277,6 +358,8 @@ function serializeProp(p) {
     activeReservationCount: reservationCount,
     peakReserved: peakRow.peak,
     availableNow: p.total_count - peakRow.peak,
+    unreturnedCheckouts: unreturned,
+    shortage: Math.max(0, peakRow.peak - p.total_count),
     createdAt: p.created_at,
   };
 }
@@ -287,6 +370,15 @@ router.get(
     if (req.user.role !== 'director') throw forbidden('仅导演可查看共享道具登记册');
     const props = db.prepare('SELECT * FROM props ORDER BY id').all();
     res.json({ props: props.map(serializeProp) });
+  })
+);
+
+// ---- 导演：库存缺口清单（损坏核销扣减总库存后，既有有效预约超量的道具；预约保留不撤销） ----
+router.get(
+  '/props/shortages',
+  wrap((req, res) => {
+    if (req.user.role !== 'director') throw forbidden('仅导演可查看库存缺口');
+    res.json({ shortages: computePropShortages() });
   })
 );
 
@@ -333,6 +425,18 @@ router.patch(
       params.push(nextTotal);
     }
     if (!fields.length) throw badRequest('至少提供一个待更新字段：name 或 totalCount');
+
+    // 库存不得调到低于“跨时段未归还领用总量”（实物仍在保管人手中，库存不能小于它）
+    if (req.body?.totalCount !== undefined) {
+      const unreturned = unreturnedCheckoutTotals().get(prop.id) || 0;
+      if (nextTotal < unreturned) {
+        throw conflict('PROP_STOCK_INSUFFICIENT', '下调后道具库存低于跨时段未归还领用总量，本次调整未生效', {
+          insufficient: [
+            { propId: prop.id, propName: prop.name, totalCount: nextTotal, unreturned, shortage: unreturned - nextTotal },
+          ],
+        });
+      }
+    }
 
     // 下调库存（或任何调整）：仅有效预约占用；任一时刻不足整次不生效，库存保持原值
     assertPropCapacity({
@@ -501,6 +605,8 @@ module.exports = {
   router,
   assertPropCapacity,
   assertPropsAfterScheduleChange,
+  computePropShortages,
+  unreturnedCheckoutTotals,
   slotPropView,
   slotPropViewForActor,
   isScheduleParticipant,

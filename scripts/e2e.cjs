@@ -1521,6 +1521,232 @@ async function main() {
   // 已取消时段对任何人都不作为“有效清单”：演员看不到（参与者也不行）
   await G(`/api/rehearsals/${rhY}/schedules/${yTouch.id}/props`, zhou, 403);
 
+  console.log('— 道具领用：办理 / 幂等请求号 / 预约与库存上限 —');
+  const directorId = (await G('/api/me', director)).user.id;
+  // 专用道具与排练：rhL1=林晚+陈默（pv1），rhL2=周海（pv1）
+  const propLampL = (await J('/api/props', director, { name: '领用灯笼E2E', totalCount: 3 }, 201)).prop.id;
+  const propDrumL = (await J('/api/props', director, { name: '领用大鼓E2E', totalCount: 1 }, 201)).prop.id;
+  const propBellL = (await J('/api/props', director, { name: '领用铃铛E2E', totalCount: 2 }, 201)).prop.id;
+  const rhL1 = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv1, name: '领用排练L1' }, 201)).id;
+  await J(`/api/rehearsals/${rhL1}/cast`, director, { roleId: roleA, actorId: linId }, 201);
+  await J(`/api/rehearsals/${rhL1}/cast`, director, { roleId: roleB, actorId: chenId }, 201);
+  const rhL2 = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv1, name: '领用排练L2' }, 201)).id;
+  await J(`/api/rehearsals/${rhL2}/cast`, director, { roleId: roleA, actorId: zhouId }, 201);
+  const L1 = (await J(`/api/rehearsals/${rhL1}/schedules`, director, { sceneId: sc1, startAt: '2036-01-01T10:00:00Z', endAt: '2036-01-01T11:00:00Z' }, 201)).schedule;
+  const L2 = (await J(`/api/rehearsals/${rhL2}/schedules`, director, { sceneId: sc1, startAt: '2036-01-01T10:30:00Z', endAt: '2036-01-01T11:30:00Z' }, 201)).schedule;
+  const L4 = (await J(`/api/rehearsals/${rhL2}/schedules`, director, { sceneId: sc1, startAt: '2036-01-01T12:00:00Z', endAt: '2036-01-01T13:00:00Z' }, 201)).schedule;
+  // L5：rhL1 的 sc2 时段（pv1 中 sc2 有甲、乙台词 -> 参与者含陈默）
+  const L5 = (await J(`/api/rehearsals/${rhL1}/schedules`, director, { sceneId: sc2, startAt: '2036-01-01T15:00:00Z', endAt: '2036-01-01T16:00:00Z' }, 201)).schedule;
+  // 预约：L1 灯笼2/大鼓1/铃铛1；L2 灯笼1/铃铛1；L4 铃铛1（与 L1/L2 不重叠）；L5 铃铛1
+  await req('PUT', `/api/rehearsals/${rhL1}/schedules/${L1.id}/props`, director,
+    { items: [{ propId: propLampL, quantity: 2 }, { propId: propDrumL, quantity: 1 }, { propId: propBellL, quantity: 1 }] }, 200);
+  await req('PUT', `/api/rehearsals/${rhL2}/schedules/${L2.id}/props`, director,
+    { items: [{ propId: propLampL, quantity: 1 }, { propId: propBellL, quantity: 1 }] }, 200);
+  await req('PUT', `/api/rehearsals/${rhL2}/schedules/${L4.id}/props`, director,
+    { items: [{ propId: propBellL, quantity: 1 }] }, 200);
+  await req('PUT', `/api/rehearsals/${rhL1}/schedules/${L5.id}/props`, director,
+    { items: [{ propId: propBellL, quantity: 1 }] }, 200);
+
+  // 权限与入参拒绝
+  const chkBase = { requestId: 'CHK-E2E-000', custodianActorId: linId, items: [{ propId: propLampL, quantity: 1 }] };
+  await J(`/api/rehearsals/${rhL1}/schedules/${L1.id}/prop-checkouts`, lin, chkBase, 403);
+  await J(`/api/rehearsals/${rhL1}/schedules/${L1.id}/prop-checkouts`, null, chkBase, 401);
+  await J(`/api/rehearsals/${rhL1}/schedules/${L1.id}/prop-checkouts`, director, { custodianActorId: linId, items: chkBase.items }, 400);
+  await J(`/api/rehearsals/${rhL1}/schedules/${L1.id}/prop-checkouts`, director, { ...chkBase, items: [] }, 400);
+  await J(`/api/rehearsals/${rhL1}/schedules/${L1.id}/prop-checkouts`, director, { ...chkBase, items: [{ propId: propLampL, quantity: 0 }] }, 400);
+  await J(`/api/rehearsals/${rhL1}/schedules/${L1.id}/prop-checkouts`, director, { ...chkBase, items: [{ propId: propLampL, quantity: -1 }] }, 400);
+  await J(`/api/rehearsals/${rhL1}/schedules/${L1.id}/prop-checkouts`, director, { ...chkBase, items: [{ propId: propLampL, quantity: 1.5 }] }, 400);
+  await J(`/api/rehearsals/${rhL1}/schedules/${L1.id}/prop-checkouts`, director, { ...chkBase, items: [{ propId: propLampL, quantity: 1 }, { propId: propLampL, quantity: 1 }] }, 400);
+  await J(`/api/rehearsals/${rhL1}/schedules/${L1.id}/prop-checkouts`, director, { ...chkBase, items: [{ propId: 99999, quantity: 1 }] }, 400);
+  await J(`/api/rehearsals/${rhL1}/schedules/${L1.id}/prop-checkouts`, director, { ...chkBase, custodianActorId: zhouId }, 400);
+  await J(`/api/rehearsals/${rhL1}/schedules/${L1.id}/prop-checkouts`, director, { ...chkBase, custodianActorId: directorId }, 400);
+  await J(`/api/rehearsals/${rhL1}/schedules/${L1.id}/prop-checkouts`, director, { ...chkBase, custodianActorId: 99999 }, 400);
+  await J('/api/rehearsals/99999/schedules/1/prop-checkouts', director, chkBase, 404);
+  await J(`/api/rehearsals/${rhL1}/schedules/99999/prop-checkouts`, director, chkBase, 404);
+  await J(`/api/rehearsals/${rhL2}/schedules/${L1.id}/prop-checkouts`, director, chkBase, 404);
+  check('领用入参：演员 403/未登录 401/缺请求号/空批/无效件数/重复道具/未知道具/保管人非参与演员/跨排练时段 均明确拒绝', true);
+
+  // 已取消与待调整时段不能办理领用（400）
+  const Lc = (await J(`/api/rehearsals/${rhL2}/schedules`, director, { sceneId: sc1, startAt: '2036-01-02T10:00:00Z', endAt: '2036-01-02T11:00:00Z' }, 201)).schedule;
+  await J(`/api/rehearsals/${rhL2}/schedules/${Lc.id}/cancel`, director, {}, 200);
+  await J(`/api/rehearsals/${rhL2}/schedules/${Lc.id}/prop-checkouts`, director,
+    { requestId: 'CHK-E2E-CXL', custodianActorId: zhouId, items: [{ propId: propLampL, quantity: 1 }] }, 400);
+  const rhLN = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv1, name: '领用排练LN' }, 201)).id;
+  await J(`/api/rehearsals/${rhLN}/cast`, director, { roleId: roleB, actorId: chenId }, 201);
+  const Ln = (await J(`/api/rehearsals/${rhLN}/schedules`, director, { sceneId: sc2, startAt: '2036-01-03T10:00:00Z', endAt: '2036-01-03T11:00:00Z' }, 201)).schedule;
+  await J(`/api/rehearsals/${rhLN}/switch-version`, director, { versionId: pv3 }, 200); // pv3 中 sc2 无台词 -> 待调整
+  await J(`/api/rehearsals/${rhLN}/schedules/${Ln.id}/prop-checkouts`, director,
+    { requestId: 'CHK-E2E-NA', custodianActorId: chenId, items: [{ propId: propLampL, quantity: 1 }] }, 400);
+  check('已取消/待调整时段不能办理领用（400）', true);
+
+  // 成功领用：L1 灯笼2+大鼓1，保管人林晚
+  const chkBody = {
+    requestId: 'CHK-E2E-001', custodianActorId: linId, note: '首演联排领用',
+    items: [{ propId: propLampL, quantity: 2 }, { propId: propDrumL, quantity: 1 }],
+  };
+  const chk1 = await J(`/api/rehearsals/${rhL1}/schedules/${L1.id}/prop-checkouts`, director, chkBody, 201);
+  check('领用成功：返回领用单（保管人/明细/未归还量）',
+    chk1.ok && chk1.idempotentReplay === false && chk1.checkout.status === 'outstanding'
+      && chk1.checkout.custodian.actorId === linId
+      && chk1.checkout.schedule.id === L1.id
+      && chk1.checkout.items.find((i) => i.propId === propLampL).outstanding === 2
+      && chk1.checkout.items.find((i) => i.propId === propDrumL).outstanding === 1
+      && chk1.checkout.totalOutstanding === 3,
+    JSON.stringify(chk1));
+  const chk1Id = chk1.checkout.id;
+  // 同号同内容重试（含明细顺序不同）-> 200 返回首次结果，不产生新单
+  const chk1re = await J(`/api/rehearsals/${rhL1}/schedules/${L1.id}/prop-checkouts`, director, chkBody, 200);
+  check('同号同内容重试返回原结果（幂等重放）', chk1re.idempotentReplay === true && chk1re.checkout.id === chk1Id);
+  const chk1re2 = await J(`/api/rehearsals/${rhL1}/schedules/${L1.id}/prop-checkouts`, director,
+    { ...chkBody, items: [chkBody.items[1], chkBody.items[0]] }, 200);
+  check('明细顺序不同仍视为同内容（归一化）', chk1re2.idempotentReplay === true && chk1re2.checkout.id === chk1Id);
+  const chkDiff = await J(`/api/rehearsals/${rhL1}/schedules/${L1.id}/prop-checkouts`, director,
+    { ...chkBody, note: '改动后的内容' }, 409);
+  check('同号异内容拒绝（409 REQUEST_ID_CONFLICT）', chkDiff.error === 'REQUEST_ID_CONFLICT');
+  const l1Chks = await G(`/api/rehearsals/${rhL1}/schedules/${L1.id}/prop-checkouts`, director);
+  check('幂等重试未产生新领用单', l1Chks.checkouts.length === 1 && l1Chks.schedule.id === L1.id, JSON.stringify(l1Chks));
+
+  // 超本时段预约量：灯笼已领 2/预约 2，再领 1 -> 409；未预约道具（令旗）-> 409
+  const exRes = await J(`/api/rehearsals/${rhL1}/schedules/${L1.id}/prop-checkouts`, director,
+    { requestId: 'CHK-E2E-002', custodianActorId: linId, items: [{ propId: propLampL, quantity: 1 }] }, 409);
+  check('领用超本时段预约量 -> 409 整次不生效', exRes.error === 'PROP_CHECKOUT_EXCEEDS_RESERVATION'
+    && exRes.details.exceeds[0].propId === propLampL
+    && exRes.details.exceeds[0].reserved === 2
+    && exRes.details.exceeds[0].alreadyCheckedOut === 2
+    && exRes.details.exceeds[0].available === 0, JSON.stringify(exRes.details));
+  const exNone = await J(`/api/rehearsals/${rhL1}/schedules/${L1.id}/prop-checkouts`, director,
+    { requestId: 'CHK-E2E-003', custodianActorId: linId, items: [{ propId: propFlag, quantity: 1 }] }, 409);
+  check('未预约道具领用 -> 409（预约量 0）', exNone.error === 'PROP_CHECKOUT_EXCEEDS_RESERVATION'
+    && exNone.details.exceeds[0].reserved === 0);
+
+  // 跨时段未归还总量不得超过现有库存：铃铛总 2，L5 领 1（陈默）、L2 领 1（周海）后，L4 再领 -> 409
+  await J(`/api/rehearsals/${rhL1}/schedules/${L5.id}/prop-checkouts`, director,
+    { requestId: 'CHK-E2E-004', custodianActorId: chenId, items: [{ propId: propBellL, quantity: 1 }] }, 201);
+  await J(`/api/rehearsals/${rhL2}/schedules/${L2.id}/prop-checkouts`, director,
+    { requestId: 'CHK-E2E-005', custodianActorId: zhouId, items: [{ propId: propBellL, quantity: 1 }, { propId: propLampL, quantity: 1 }] }, 201);
+  const exStock = await J(`/api/rehearsals/${rhL2}/schedules/${L4.id}/prop-checkouts`, director,
+    { requestId: 'CHK-E2E-006', custodianActorId: zhouId, items: [{ propId: propBellL, quantity: 1 }] }, 409);
+  check('跨时段未归还总量超现有库存 -> 409 整次不生效', exStock.error === 'PROP_STOCK_INSUFFICIENT'
+    && exStock.details.insufficient[0].propId === propBellL
+    && exStock.details.insufficient[0].unreturned === 2
+    && exStock.details.insufficient[0].totalCount === 2
+    && exStock.details.insufficient[0].available === 0, JSON.stringify(exStock.details));
+
+  // 责任清单 / 登记册 / 详情 / 权限
+  const liability = await G('/api/prop-checkouts?status=outstanding', director);
+  check('责任清单：未归还领用单（含保管人与各道具未归还量）',
+    liability.checkouts.length === 3
+      && liability.checkouts.every((c) => c.status === 'outstanding')
+      && liability.checkouts.some((c) => c.id === chk1Id && c.custodian.actorId === linId && c.totalOutstanding === 3),
+    JSON.stringify(liability.checkouts.map((x) => [x.id, x.totalOutstanding])));
+  await G('/api/prop-checkouts?status=bogus', director, 400);
+  await G('/api/prop-checkouts', lin, 403);
+  await G('/api/props/shortages', lin, 403);
+  await G(`/api/rehearsals/${rhL1}/schedules/${L1.id}/prop-checkouts`, lin, 403);
+  const regLamp = (await G('/api/props', director)).props.find((p) => p.id === propLampL);
+  check('登记册显示未归还领用量（灯笼 3）', regLamp.unreturnedCheckouts === 3, JSON.stringify(regLamp));
+  const chk1Detail = await G(`/api/prop-checkouts/${chk1Id}`, director);
+  check('领用单详情含归还流水（初始为空）', Array.isArray(chk1Detail.checkout.returns) && chk1Detail.checkout.returns.length === 0);
+  await G(`/api/prop-checkouts/${chk1Id}`, lin, 403);
+  await G('/api/prop-checkouts/99999', director, 404);
+  const l1View0 = await G(`/api/rehearsals/${rhL1}/schedules/${L1.id}/props`, director);
+  check('时段预约视图含领用进度（领用/未还）',
+    l1View0.props.find((p) => p.propId === propLampL).checkedOut === 2
+      && l1View0.props.find((p) => p.propId === propLampL).outstanding === 2
+      && l1View0.props.find((p) => p.propId === propDrumL).checkedOut === 1
+      && l1View0.props.find((p) => p.propId === propBellL).checkedOut === 0,
+    JSON.stringify(l1View0.props));
+
+  console.log('— 道具归还：分批登记 / 损坏核销 / 缺口显示与后续校验 —');
+  // 入参：演员 403；领用单不存在 404；归还道具不在单中 400；0+0 400；空批 400；超未归还量 409
+  await J(`/api/prop-checkouts/${chk1Id}/returns`, lin, { items: [{ propId: propLampL, good: 1 }] }, 403);
+  await J('/api/prop-checkouts/99999/returns', director, { items: [{ propId: propLampL, good: 1 }] }, 404);
+  await J(`/api/prop-checkouts/${chk1Id}/returns`, director, { items: [{ propId: propBellL, good: 1 }] }, 400);
+  await J(`/api/prop-checkouts/${chk1Id}/returns`, director, { items: [{ propId: propLampL, good: 0, damaged: 0 }] }, 400);
+  await J(`/api/prop-checkouts/${chk1Id}/returns`, director, { items: [] }, 400);
+  await J(`/api/prop-checkouts/${chk1Id}/returns`, director, { items: [{ propId: propLampL, good: -1 }] }, 400);
+  const exRet = await J(`/api/prop-checkouts/${chk1Id}/returns`, director, { items: [{ propId: propLampL, good: 3 }] }, 409);
+  check('归还合计超未归还量 -> 409 整批不生效', exRet.error === 'PROP_RETURN_EXCEEDS_OUTSTANDING'
+    && exRet.details.exceeds[0].outstanding === 2 && exRet.details.exceeds[0].requested === 3, JSON.stringify(exRet.details));
+  // 分批归还：第一批完好 1（无缺口）
+  const ret1 = await J(`/api/prop-checkouts/${chk1Id}/returns`, director, { items: [{ propId: propLampL, good: 1 }], note: '第一批' }, 201);
+  check('分批归还第一批成功（无缺口）', ret1.ok && ret1.shortages.length === 0
+    && ret1.checkout.items.find((i) => i.propId === propLampL).outstanding === 1, JSON.stringify(ret1));
+  // 第二批：灯笼完好 1 + 大鼓损坏 1（损坏扣库存 1->0；大鼓既有有效预约 1 超量 -> 显示缺口）
+  const ret2 = await J(`/api/prop-checkouts/${chk1Id}/returns`, director,
+    { items: [{ propId: propLampL, good: 1 }, { propId: propDrumL, damaged: 1 }], note: '第二批' }, 201);
+  check('第二批归还成功：灯笼清零、大鼓损坏核销，整单结清', ret2.checkout.status === 'cleared'
+    && ret2.checkout.items.find((i) => i.propId === propDrumL).returnedDamaged === 1
+    && ret2.checkout.totalOutstanding === 0, JSON.stringify(ret2.checkout));
+  check('损坏件数扣减道具总库存（大鼓 1 -> 0）',
+    (await G('/api/props', director)).props.find((p) => p.id === propDrumL).totalCount === 0);
+  check('损坏核销后既有有效预约超量：保留预约并在归还响应中显示缺口',
+    ret2.shortages.some((s) => s.propId === propDrumL && s.shortage === 1 && s.totalCount === 0 && s.peakReserved === 1),
+    JSON.stringify(ret2.shortages));
+  const exRet2 = await J(`/api/prop-checkouts/${chk1Id}/returns`, director, { items: [{ propId: propDrumL, damaged: 1 }] }, 409);
+  check('结清后继续归还 -> 409', exRet2.error === 'PROP_RETURN_EXCEEDS_OUTSTANDING');
+  // 缺口清单与后续校验
+  const gapList = await G('/api/props/shortages', director);
+  check('导演查看库存缺口清单（含冲突时段）', gapList.shortages.length === 1
+    && gapList.shortages[0].propId === propDrumL
+    && gapList.shortages[0].schedules.some((x) => x.id === L1.id), JSON.stringify(gapList));
+  const l1PropsGap = await G(`/api/rehearsals/${rhL1}/schedules/${L1.id}/props`, director);
+  check('缺口下既有预约保留（不撤销）', l1PropsGap.props.find((p) => p.propId === propDrumL).quantity === 1);
+  const reReserve = await req('PUT', `/api/rehearsals/${rhL1}/schedules/${L1.id}/props`, director,
+    { items: [{ propId: propDrumL, quantity: 1 }] }, 409);
+  check('后续预约按新库存校验（同值重提也 409）', reReserve.error === 'PROP_CAPACITY_CONFLICT');
+  const moveL1 = await req('PATCH', `/api/rehearsals/${rhL1}/schedules/${L1.id}`, director,
+    { startAt: '2036-01-01T14:00:00Z', endAt: '2036-01-01T15:00:00Z' }, 409);
+  check('后续调期按新库存校验（整体不生效，时间不变）', moveL1.error === 'PROP_CAPACITY_CONFLICT'
+    && (await G(`/api/rehearsals/${rhL1}/schedules/${L1.id}/props`, director)).schedule.startAt === '2036-01-01T10:00:00.000Z');
+  await req('PUT', `/api/rehearsals/${rhL1}/schedules/${L1.id}/props`, director, { items: [{ propId: propDrumL, quantity: 0 }] }, 200);
+  check('撤销超量预约后缺口消失', (await G('/api/props/shortages', director)).shortages.length === 0);
+
+  console.log('— 道具领还：取消 / 改派 / 换版不抹除流水与责任 —');
+  // L2（周海保管：灯笼1+铃铛1 未归还）取消 -> 流水与责任保留
+  await J(`/api/rehearsals/${rhL2}/schedules/${L2.id}/cancel`, director, {}, 200);
+  const afterCancel = await G('/api/prop-checkouts?status=outstanding', director);
+  const l2chk = afterCancel.checkouts.find((c) => c.schedule.id === L2.id);
+  check('时段取消不抹除领还流水与原保管人责任', !!l2chk && l2chk.schedule.status === 'cancelled'
+    && l2chk.custodian.actorId === zhouId && l2chk.totalOutstanding === 2, JSON.stringify(l2chk));
+  // 改派：rhL1 甲 林晚->陈默（陈默已兼乙，不引入冲突）；林晚的保管人记录不变
+  await J(`/api/rehearsals/${rhL1}/cast`, director, { roleId: roleA, actorId: chenId }, 200);
+  const chk1AfterCast = await G(`/api/prop-checkouts/${chk1Id}`, director);
+  check('改派不抹除原保管人记录', chk1AfterCast.checkout.custodian.actorId === linId
+    && chk1AfterCast.checkout.returns.length === 3);
+  // 换版：rhL1 pv1->pv2（流水与责任不变）
+  await J(`/api/rehearsals/${rhL1}/switch-version`, director, { versionId: pv2 }, 200);
+  const chk1AfterSw = await G(`/api/prop-checkouts/${chk1Id}`, director);
+  check('换版不抹除领还流水', chk1AfterSw.checkout.id === chk1Id && chk1AfterSw.checkout.custodian.actorId === linId);
+
+  console.log('— 道具领还：演员仅查看本人领还流水 / 下调库存守卫 —');
+  const linFlow = await G('/api/me/prop-checkouts', lin);
+  check('演员查看本人领还流水（含归还记录）',
+    linFlow.checkouts.length === 1 && linFlow.checkouts[0].id === chk1Id
+      && linFlow.checkouts[0].returns.length === 3
+      && linFlow.checkouts[0].items.every((i) => i.outstanding === 0), JSON.stringify(linFlow));
+  const zhouFlow = await G('/api/me/prop-checkouts', zhou);
+  check('演员只见本人流水（周海不见林晚的单）',
+    zhouFlow.checkouts.length === 1 && zhouFlow.checkouts.every((c) => c.custodian.actorId === zhouId)
+      && zhouFlow.checkouts[0].totalOutstanding === 2, JSON.stringify(zhouFlow));
+  const chenFlow = await G('/api/me/prop-checkouts', chen);
+  check('陈默的流水含 L5 铃铛领用单', chenFlow.checkouts.length === 1
+    && chenFlow.checkouts[0].schedule.id === L5.id
+    && chenFlow.checkouts[0].items.some((i) => i.propId === propBellL && i.outstanding === 1));
+  await G('/api/me/prop-checkouts', director, 403);
+  check('导演不能用演员视角接口（403）', true);
+  // 铃铛未归还 2（陈默 1 + 周海 1）：下调到 1 拒绝；库存保持 2
+  const lowerBell = await req('PATCH', `/api/props/${propBellL}`, director, { totalCount: 1 }, 409);
+  check('下调库存低于未归还领用量 -> 409 且库存不变', lowerBell.error === 'PROP_STOCK_INSUFFICIENT'
+    && lowerBell.details.insufficient[0].unreturned === 2
+    && (await G('/api/props', director)).props.find((p) => p.id === propBellL).totalCount === 2,
+    JSON.stringify(lowerBell));
+  // 周海归还铃铛 1 后未归还降为 1，可下调到 1
+  const zhouChkId = zhouFlow.checkouts[0].id;
+  await J(`/api/prop-checkouts/${zhouChkId}/returns`, director, { items: [{ propId: propBellL, good: 1 }] }, 201);
+  await req('PATCH', `/api/props/${propBellL}`, director, { totalCount: 1 }, 200);
+  check('归还降低未归还量后可下调库存', true);
+
   console.log('— 临时替角：设置 / 替换 / 撤回与最终参与者、通知 —');
   {
     // 新剧 v1：场景 tS1 有 roleT(甲) 与 roleU(乙) 台词，场景 tS2 只有 roleT 台词
