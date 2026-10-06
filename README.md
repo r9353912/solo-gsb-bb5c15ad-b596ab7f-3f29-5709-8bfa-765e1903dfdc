@@ -205,6 +205,34 @@
 7. **演员只可查看自己当前参与的有效时段的道具清单**（仅道具名称与本时段件数，不见库存、余量与其他预约）；
    非参与时段、待调整/已取消时段、登记册与任何写入接口均 `403`。演员与导演的日程列表均带 `props` 简表。
 
+### 共享道具实物领用与归还（按预约出库、按原单归还）
+
+1. 导演从**有效（active）时段的有效预约**中办理**实物领用**（`POST /api/prop-loans`），一次可领多个道具，
+   并指定**一名该时段当前参与演员为保管人**（常驻派角或该时段生效替角；非参与者拒绝）。
+2. 领用**整次校验，任一项不合格整次不生效**（`409 PROP_LOAN_REJECTED`，`details.items` 逐条给出原因，
+   不写任何流水）：
+   - **本时段口径**：每道具“该时段历次领用总量（毛额，含已归还）+ 本次件数”**不得超过本时段预约量**
+     （`OVER_SLOT_RESERVATION`，返回预约量、已领量、剩余可领）；
+   - **库存口径**：每道具“**跨时段未归还总量 + 本次件数不得超过现有库存**”
+     （`OVER_STOCK`，返回库存、跨时段未归还、净可用）。
+3. 领用请求必须携带导演侧**唯一请求号 `requestNo`**：**同号同内容重试返回首次原结果**
+   （响应 `replayed:true`、同一领用单）；**同号异内容拒绝**（`409 PROP_LOAN_REQUEST_CONFLICT`）。
+4. 导演**按原领用记录分批登记归还**（`POST /api/prop-loans/:id/returns`），每批可登记
+   **完好件数 `good` 与损坏件数 `damaged`**（至少一项为正）；同一明细**合计不得超过未归还量**
+   （`409 PROP_RETURN_REJECTED / OVER_OUTSTANDING`，整批不生效）。**损坏件数扣减道具总库存**
+   （不会为负）。
+5. **损坏扣减后既有有效预约可能超量：保留预约并显示缺口**——不回滚、不抹除预约；
+   归还响应与 `GET /api/props/shortages`、登记册的 `reservationShortage` 均展示
+   （缺口数=峰值占用−库存、峰值时刻与冲突时段）。**后续预约与调期按新库存校验**：
+   允许保持既有缺口（同值/不相接不叠加的预约可提交），但**任何把峰值占用进一步抬高到库存以上的
+   预约或调期仍 `409 PROP_CAPACITY_CONFLICT` 整体不生效**；导演人工下调库存仍按现有预约严格拒绝。
+6. **取消、转待调整、改派、换版均不抹除领还流水与原保管人的未归还责任**：
+   时段与保管人在流水中留痕（时段显示为 cancelled/needs_adjustment 也可查、可继续按原单归还）；
+   已取消/待调整时段**不能新办领用**。
+7. 可见性：导演查看**库存缺口**（`GET /api/props/shortages`）与**领用责任清单**
+   （`GET /api/prop-loans/responsibilities`，按保管人归并的全部未归还明细）、任意领用单与流水；
+   **演员仅查看本人作为保管人的领还流水**（`GET /api/me/prop-loans`），其他单据 `403`。
+
 ## 一键启动（Docker，推荐）
 
 前置：已安装 Docker 与 Docker Compose v2。
@@ -295,6 +323,9 @@ PORT=8080 docker compose up --build -d
   查看每道具的有效预约时段数、峰值同时占用与当前余量。
 - **导演 → 排练与确认 → 日程行「道具」**：为每个时段填写/撤销各道具目标件数，查看该时段预约与时段内最低余量；
   批量预约、调期携带移动、取消释放、待调整恢复校验均在接口层给出冲突时段与缺口。
+  实物**领用/归还走 HTTP API**（见下文《实物领用 / 归还接口调用示例》）：导演从有效时段预约办理领用并指定该时段
+  当前参与演员为保管人，按原领用单分批登记完好/损坏归还，损坏扣库存并保留显示既有预约缺口；可查库存缺口与
+  按保管人归并的责任清单，演员仅查本人领还流水；取消/转待调整/改派/换版不抹除流水与原保管人责任。
 - **演员 → 我的排练时段**：自己当前参与的有效时段行内显示**共享道具清单**（名称×件数），不可见库存/余量/其他时段。
 - **导演 → 总览**：所有排练的待确认汇总与最近冲突详情。
 - **演员**：进入排练后仅显示本人角色台词，按场次点“确认本场台词”；换版或改派后相应场次会回到待确认；
@@ -347,6 +378,13 @@ PORT=8080 docker compose up --build -d
 | PATCH | `/api/props/:propId` | 调整道具总量/改名（导演；下调时校验全部有效预约，不足整次不生效） |
 | GET/PUT | `/api/rehearsals/:id/schedules/:sid/props` | 查看时段预约与最低余量（演员仅限本人参与的有效时段且只见清单）/ 填写道具目标件数（导演；`quantity=0` 撤销，未列出的道具不变） |
 | POST | `/api/schedules/props/batch` | 批量修改多个时段的道具预约（导演，至少两条，可跨排练）：整批最终状态校验，任一时刻不足整批不生效，返回道具/冲突时段/缺口 |
+| POST | `/api/prop-loans` | 实物领用（导演）：仅有效时段；指定该时段当前参与演员为保管人；每道具不超本时段预约量、跨时段未还+本次不超库存，任一不符整次不生效；`requestNo` 同号同内容重放原结果、同号异内容 `409 PROP_LOAN_REQUEST_CONFLICT` |
+| POST | `/api/prop-loans/:id/returns` | 按原领用单分批登记归还（导演）：`items:[{loanItemId, good, damaged}]`，合计不超未归还量；损坏件扣减总库存，响应返回扣减后库存与既有预约缺口 |
+| GET | `/api/prop-loans` | 领用单列表（导演可 `?scheduleId=`/`?custodianActorId=` 过滤；演员仅本人作为保管人者） |
+| GET | `/api/prop-loans/:id` | 领用单详情含逐项未归还量与逐批归还流水（非保管人演员 403） |
+| GET | `/api/me/prop-loans` | 演员本人领还流水（仅本人作为保管人的领用单） |
+| GET | `/api/prop-loans/responsibilities` | 领用责任清单（导演）：按保管人归并的全部未归还明细 |
+| GET | `/api/props/shortages` | 库存缺口（导演）：损坏扣库存后超量的既有有效预约（保留显示），含缺口数/峰值时刻/冲突时段 |
 | GET | `/api/actor-rates` | 演员每小时费率表（仅导演；未设置为 `null`，显式 0 与未设置区分） |
 | PUT | `/api/actors/:actorId/rate` | 设置演员费率（导演；`rateCentsPerHour` 非负整数，单位 分/小时） |
 | GET | `/api/me/rate` | 演员查看本人当前费率 |
@@ -360,6 +398,8 @@ PORT=8080 docker compose up --build -d
 典型状态码：`400`（无效版本/场次/参数、状态不允许的操作）、`401`（未登录）、`403`（越权）、`404`（不存在）、
 `409`（业务冲突，如 `OLD_TEXT_MISMATCH`、`PUBLISH_CONFLICT`、`SCHEDULE_CONFLICT`、
 `UNAVAILABILITY_CONFLICT`、`ATTENDANCE_EXISTS`、`ATTENDANCE_NOT_OPEN`、`NOTIFICATION_EXPIRED`、`PREVIEW_STALE`、`PROP_CAPACITY_CONFLICT`、`ATTENDANCE_FROZEN`、
+`PROP_LOAN_REQUEST_CONFLICT`（同号异内容）、`PROP_LOAN_REJECTED`（领用超本时段预约量/跨时段超库存/保管人不合格，整次不生效）、
+`PROP_RETURN_REJECTED`（归还合计超未归还量，整批不生效）、
 `SETTLEMENT_DUPLICATE_SESSION`（400，整单重复选择登记）、`SETTLEMENT_SESSION_ALREADY_SETTLED`（409，登记已结算）；
 无费率/未关闭/已作废等结算入参问题为 `400 BAD_REQUEST`，`details.code` 分别为
 `SETTLEMENT_RATE_MISSING` / `SETTLEMENT_SESSION_NOT_CLOSED` / `SETTLEMENT_VOIDED_SESSION` / `SETTLEMENT_DUPLICATE_SESSION`，任何拒绝均不占用登记）。
@@ -824,6 +864,85 @@ curl -s http://localhost:3000/api/rehearsals/1/schedules/2/props \
 # -> 200 {"scheduleId":2,"status":"active",
 #        "props":[{"propId":1,"propName":"煤油灯","quantity":2}]}
 ```
+
+## 实物领用 / 归还接口调用示例（curl）
+
+```bash
+# 0. 导演登录拿 token；假设时段 2（有效）已预约煤油灯(propId=1)×1，演员 2（林晚）当前参与该时段
+TOKEN=$(curl -s -X POST http://localhost:3000/api/login -H 'Content-Type: application/json' \
+  -d '{"username":"director","password":"director123"}' | sed 's/.*"token":"\([^"]*\)".*/\1/')
+
+# 1. 办理领用：从有效时段的预约中出库，指定该时段当前参与演员为保管人；携带唯一请求号
+curl -s -X POST http://localhost:3000/api/prop-loans \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"requestNo":"loan-20261010-01","scheduleId":2,"custodianActorId":2,"note":"风暴前夜场",
+       "items":[{"propId":1,"quantity":1}]}'
+# -> 201 {"ok":true,"replayed":false,
+#        "loan":{"id":11,"requestNo":"loan-20261010-01","note":"风暴前夜场",
+#          "schedule":{"id":2,"status":"active","startAt":"...","endAt":"..."},
+#          "custodian":{"id":2,"username":"lin","displayName":"林晚"},
+#          "items":[{"id":31,"propId":1,"propName":"煤油灯","quantity":1,
+#            "returnedGood":0,"returnedDamaged":0,"outstanding":1}],
+#          "returns":[]}}
+
+# 2. 同号同内容重试（网络超时重发等）-> 直接返回首次原结果，不重复出库
+curl -s -X POST http://localhost:3000/api/prop-loans \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"requestNo":"loan-20261010-01","scheduleId":2,"custodianActorId":2,"note":"风暴前夜场",
+       "items":[{"propId":1,"quantity":1}]}'
+# -> 200 {"ok":true,"replayed":true,"loan":{"id":11, ...与首次完全相同...}}
+
+# 3. 同号异内容 -> 409 拒绝（须换新请求号；或用完全相同的请求体重放）
+# 4. 任一项不合格 -> 409 PROP_LOAN_REJECTED 整次不生效，details.items 逐条说明：
+curl -s -X POST http://localhost:3000/api/prop-loans \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"requestNo":"loan-20261010-02","scheduleId":2,"custodianActorId":2,
+       "items":[{"propId":1,"quantity":1}]}'
+# -> 409 {"error":"PROP_LOAN_REJECTED","message":"领用校验未通过，整次未生效",
+#        "details":{"items":[{"propId":1,"propName":"煤油灯",
+#          "code":"OVER_SLOT_RESERVATION","message":"该道具本时段领用总量将超过本时段预约量",
+#          "reserved":1,"alreadyLoanedForSlot":1,"requested":1,"remaining":0}]}}
+#    跨时段未归还+本次超库存时 code=OVER_STOCK（totalCount/outstandingAcrossSlots/available）；
+#    保管人非该时段当前参与者、时段非 active -> 400；未登录 401；演员调用 403。
+
+# 5. 按原领用记录分批登记归还：loanItemId=31，先还 1 件损坏（good/damaged 至少一项为正）
+curl -s -X POST http://localhost:3000/api/prop-loans/11/returns \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"note":"灯罩摔裂报废","items":[{"loanItemId":31,"good":0,"damaged":1}]}'
+# -> 201 {"ok":true,"returnId":5,
+#        "stockAfter":[{"propId":1,"propName":"煤油灯","damagedDeducted":1,"totalCount":1}],
+#        "reservationShortages":[...扣减后超量的既有有效预约（保留显示），无则为 []...],
+#        "loan":{... "items":[{"id":31,"returnedGood":0,"returnedDamaged":1,"outstanding":0}],
+#                "returns":[{"id":5,"items":[{"loanItemId":31,"propId":1,"good":0,"damaged":1}]}]}}
+#    合计超过该明细未归还量 -> 409 PROP_RETURN_REJECTED / OVER_OUTSTANDING（整批不生效）；
+#    明细不属于该领用单 409；good+damaged=0 或空批次 400。
+
+# 6. 导演查看库存缺口（损坏扣库存后既有有效预约超量；预约保留）
+curl -s http://localhost:3000/api/props/shortages -H "Authorization: Bearer $TOKEN"
+# -> {"shortages":[{"propId":1,"propName":"煤油灯","totalCount":1,"peakReserved":2,
+#                   "shortage":1,"peakAt":"...","schedules":[...峰值时刻占用中的时段...]}]}
+#    登记册 GET /api/props 中对应道具另给 reservationShortage / outstandingLoans / onHand。
+#    此后把缺口进一步拉大的新预约/调期仍 409 PROP_CAPACITY_CONFLICT；不抬高缺口的预约允许。
+
+# 7. 导演查看领用责任清单（全部未归还明细，按保管人归并）
+curl -s http://localhost:3000/api/prop-loans/responsibilities -H "Authorization: Bearer $TOKEN"
+# -> {"totalOutstandingItems":3,
+#     "custodians":[{"custodian":{"id":2,"displayName":"林晚"},
+#       "items":[{"loanId":11,"requestNo":"loan-20261010-01","loanItemId":31,
+#         "propName":"煤油灯","quantity":1,"returnedGood":0,"returnedDamaged":0,
+#         "outstanding":1,"schedule":{"id":2,"status":"active",...}}]}]}
+
+# 8. 查询领用单（导演可按 ?scheduleId= / ?custodianActorId= 过滤；详情含逐批归还流水）
+curl -s "http://localhost:3000/api/prop-loans?scheduleId=2" -H "Authorization: Bearer $TOKEN"
+curl -s http://localhost:3000/api/prop-loans/11 -H "Authorization: Bearer $TOKEN"
+
+# 9. 演员（林晚）只看本人作为保管人的领还流水；他人单据 403；缺口/责任清单 403
+curl -s http://localhost:3000/api/me/prop-loans -H "Authorization: Bearer <ACTOR_TOKEN>"
+# -> {"loans":[{"id":11,"custodian":{"id":2,...},"items":[...],"returns":[...]}]}
+#    说明：时段取消/转待调整、改派、换版均不抹除流水；取消后仍可按原领用单登记归还，
+#    原保管人的未归还责任一直保留到还清（含损坏件）为止。
+```
+
 
 ## 临时替角接口调用示例（curl）
 

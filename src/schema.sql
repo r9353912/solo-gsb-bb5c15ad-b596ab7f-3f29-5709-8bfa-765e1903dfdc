@@ -436,3 +436,73 @@ CREATE TABLE IF NOT EXISTS settlement_session_marks (
   created_at            TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_settlement_marks_settlement ON settlement_session_marks(settlement_id);
+
+-- ============================================================================
+-- 共享道具实物领用 / 归还流水
+-- ============================================================================
+-- 一次领用单：导演在“有效时段的道具预约”基础上办理实物领用，并指定一名该时段
+--   当前参与演员为保管人。
+--   * request_no 为调用方提供的唯一请求号（按导演唯一）：同号同内容重试直接返回
+--     原结果（幂等重放），同号异内容 409 PROP_LOAN_REQUEST_CONFLICT 拒绝。
+--   * 每道具“该时段历次领用总量（毛额，含已归还）”不得超过本时段预约量；
+--     每道具“跨时段未归还总量 + 本次领用件数”不得超过现有库存 total_count。
+--   * 取消 / 转待调整 / 改派 / 换版均不抹除流水：时段与保管人仅作外键留痕（不级联
+--     删除、不 ON UPDATE），原保管人的未归还责任始终挂在本人名下。
+--   * content_hash 为幂等指纹：规范化后的请求体（scheduleId/custodianActorId/items）。
+CREATE TABLE IF NOT EXISTS prop_loans (
+  id                  INTEGER PRIMARY KEY,
+  request_no          TEXT NOT NULL,
+  schedule_id         INTEGER NOT NULL REFERENCES rehearsal_schedules(id),
+  rehearsal_id        INTEGER NOT NULL REFERENCES rehearsals(id),
+  scene_id            INTEGER NOT NULL REFERENCES scenes(id),
+  custodian_actor_id  INTEGER NOT NULL REFERENCES users(id),
+  note                TEXT NOT NULL DEFAULT '',
+  content_hash        TEXT NOT NULL,
+  created_by          INTEGER REFERENCES users(id),
+  created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (created_by, request_no)
+);
+CREATE INDEX IF NOT EXISTS idx_prop_loans_schedule ON prop_loans(schedule_id);
+CREATE INDEX IF NOT EXISTS idx_prop_loans_custodian ON prop_loans(custodian_actor_id);
+
+-- 领用单明细：一行 = 一次领用单 × 一个道具。
+--   quantity=领用件数；returned_good=累计完好归还；returned_damaged=累计损坏件数。
+--   outstanding = quantity - returned_good - returned_damaged（未归还量），
+--   由 CHECK 约束保证归还合计不超过领用件数。
+CREATE TABLE IF NOT EXISTS prop_loan_items (
+  id               INTEGER PRIMARY KEY,
+  loan_id          INTEGER NOT NULL REFERENCES prop_loans(id) ON DELETE CASCADE,
+  prop_id          INTEGER NOT NULL REFERENCES props(id),
+  prop_name        TEXT NOT NULL,          -- 领用当时名称快照（道具改名不影响流水）
+  quantity         INTEGER NOT NULL CHECK (quantity > 0),
+  returned_good    INTEGER NOT NULL DEFAULT 0 CHECK (returned_good >= 0),
+  returned_damaged INTEGER NOT NULL DEFAULT 0 CHECK (returned_damaged >= 0),
+  UNIQUE (loan_id, prop_id),
+  CHECK (returned_good + returned_damaged <= quantity)
+);
+CREATE INDEX IF NOT EXISTS idx_prop_loan_items_prop ON prop_loan_items(prop_id);
+
+-- 归还批次：导演“按原领用记录分批登记”的一次提交（可同时登记完好与损坏件数）。
+--   损坏件数在归还事务内扣减 props.total_count（可能为 0，但不会为负）；
+--   扣减后既有有效预约可能超量——保留预约并在缺口视图中展示。
+CREATE TABLE IF NOT EXISTS prop_returns (
+  id          INTEGER PRIMARY KEY,
+  loan_id     INTEGER NOT NULL REFERENCES prop_loans(id),
+  note        TEXT NOT NULL DEFAULT '',
+  created_by  INTEGER REFERENCES users(id),
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_prop_returns_loan ON prop_returns(loan_id);
+
+-- 归还批次明细：一行 = 批次 × 领用明细；good_count/damaged_count 至少一项为正，
+-- 二者合计不得超过该明细当时的未归还量（由服务端事务校验后落库）。
+CREATE TABLE IF NOT EXISTS prop_return_items (
+  id              INTEGER PRIMARY KEY,
+  return_id       INTEGER NOT NULL REFERENCES prop_returns(id) ON DELETE CASCADE,
+  loan_item_id    INTEGER NOT NULL REFERENCES prop_loan_items(id),
+  prop_id         INTEGER NOT NULL REFERENCES props(id),
+  good_count      INTEGER NOT NULL DEFAULT 0 CHECK (good_count >= 0),
+  damaged_count   INTEGER NOT NULL DEFAULT 0 CHECK (damaged_count >= 0),
+  CHECK (good_count + damaged_count > 0)
+);
+CREATE INDEX IF NOT EXISTS idx_prop_return_items_item ON prop_return_items(loan_item_id);

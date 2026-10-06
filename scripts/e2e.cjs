@@ -1521,6 +1521,208 @@ async function main() {
   // 已取消时段对任何人都不作为“有效清单”：演员看不到（参与者也不行）
   await G(`/api/rehearsals/${rhY}/schedules/${yTouch.id}/props`, zhou, 403);
 
+  console.log('— 实物领用：入参校验 / 保管人 / 幂等请求号 —');
+  {
+    const propLoanX = (await J('/api/props', director, { name: '领用道具E2E', totalCount: 2 }, 201)).prop.id;
+    // L1=rhX(林晚+陈默) sc1；L2=rhY(周海) sc1；2036-01，互不撞档（演员也不重叠）
+    const l1 = (await J(`/api/rehearsals/${rhX}/schedules`, director,
+      { sceneId: sc1, startAt: '2036-01-10T10:00:00Z', endAt: '2036-01-10T11:00:00Z' }, 201)).schedule;
+    const l2 = (await J(`/api/rehearsals/${rhY}/schedules`, director,
+      { sceneId: sc1, startAt: '2036-01-10T12:00:00Z', endAt: '2036-01-10T13:00:00Z' }, 201)).schedule;
+    // 预约：各 1 件（库存 2，跨时段不重叠，峰值 1）
+    await req('PUT', `/api/rehearsals/${rhX}/schedules/${l1.id}/props`, director,
+      { items: [{ propId: propLoanX, quantity: 1 }] }, 200);
+    await req('PUT', `/api/rehearsals/${rhY}/schedules/${l2.id}/props`, director,
+      { items: [{ propId: propLoanX, quantity: 1 }] }, 200);
+
+    // 入参 / 权限
+    await J('/api/prop-loans', lin, { requestNo: 'X', scheduleId: l1.id, custodianActorId: linId, items: [{ propId: propLoanX, quantity: 1 }] }, 403);
+    await J('/api/prop-loans', director, { scheduleId: l1.id, custodianActorId: linId, items: [{ propId: propLoanX, quantity: 1 }] }, 400);
+    await J('/api/prop-loans', director, { requestNo: 'LO-E1', scheduleId: 99999, custodianActorId: linId, items: [{ propId: propLoanX, quantity: 1 }] }, 404);
+    await J('/api/prop-loans', director, { requestNo: 'LO-E1', scheduleId: l1.id, custodianActorId: 99999, items: [{ propId: propLoanX, quantity: 1 }] }, 400);
+    await J('/api/prop-loans', director, { requestNo: 'LO-E1', scheduleId: l1.id, custodianActorId: zhouId, items: [{ propId: propLoanX, quantity: 1 }] }, 400);
+    await J('/api/prop-loans', director, { requestNo: 'LO-E1', scheduleId: l1.id, custodianActorId: linId, items: [] }, 400);
+    await J('/api/prop-loans', director, { requestNo: 'LO-E1', scheduleId: l1.id, custodianActorId: linId, items: [{ propId: propLoanX, quantity: 0 }] }, 400);
+    await J('/api/prop-loans', director, { requestNo: 'LO-E1', scheduleId: l1.id, custodianActorId: linId, items: [{ propId: 99999, quantity: 1 }] }, 400);
+    await J('/api/prop-loans', director, { requestNo: 'LO-E1', scheduleId: l1.id, custodianActorId: linId,
+      items: [{ propId: propLoanX, quantity: 1 }, { propId: propLoanX, quantity: 1 }] }, 400);
+    check('演员调用/缺请求号/未知时段或道具/非参与保管人/空批次/非正数/重复道具均拒绝', true);
+
+    // 成功领用 1 件，保管人林晚
+    const loanBody = { requestNo: 'LO-1', scheduleId: l1.id, custodianActorId: linId, note: '上午场', items: [{ propId: propLoanX, quantity: 1 }] };
+    const loan1 = await J('/api/prop-loans', director, loanBody, 201);
+    check('领用成功：保管人/件数/未归还量正确',
+      loan1.replayed === false && loan1.loan.id >= 1 && loan1.loan.custodian.id === linId
+        && loan1.loan.items[0].quantity === 1 && loan1.loan.items[0].outstanding === 1,
+      JSON.stringify(loan1));
+    // 同号同内容重试 -> 原结果
+    const replay = await J('/api/prop-loans', director, loanBody, 200);
+    check('同号同内容重试返回原结果（replayed，同一领用单）',
+      replay.replayed === true && replay.loan.id === loan1.loan.id
+        && replay.loan.items[0].outstanding === 1, JSON.stringify(replay));
+    // 同号异内容 -> 409
+    const conflictReq = await J('/api/prop-loans', director,
+      { requestNo: 'LO-1', scheduleId: l1.id, custodianActorId: chenId, items: [{ propId: propLoanX, quantity: 1 }] }, 409);
+    check('同号异内容 409 PROP_LOAN_REQUEST_CONFLICT',
+      conflictReq.error === 'PROP_LOAN_REQUEST_CONFLICT'
+        && conflictReq.details.existingLoanId === loan1.loan.id, JSON.stringify(conflictReq));
+
+    console.log('— 实物领用：时段预约量 / 跨时段库存校验（整次不生效）—');
+    // 林晚对 L1 再领 1 件 -> 该时段历史毛领用 1+1 > 预约 1
+    const overSlot = await J('/api/prop-loans', director,
+      { requestNo: 'LO-2', scheduleId: l1.id, custodianActorId: linId, items: [{ propId: propLoanX, quantity: 1 }] }, 409);
+    check('超过本时段预约量 -> 409 OVER_SLOT_RESERVATION',
+      overSlot.error === 'PROP_LOAN_REJECTED'
+        && overSlot.details.items[0].code === 'OVER_SLOT_RESERVATION'
+        && overSlot.details.items[0].reserved === 1
+        && overSlot.details.items[0].alreadyLoanedForSlot === 1, JSON.stringify(overSlot.details));
+    // 周海在 L2 领 1 件：此时林晚已持有 1（库存 2，剩余 1）-> 成功
+    const loan2 = await J('/api/prop-loans', director,
+      { requestNo: 'LO-3', scheduleId: l2.id, custodianActorId: zhouId, items: [{ propId: propLoanX, quantity: 1 }] }, 201);
+    check('跨时段未归还未超库存可领用（不同保管人各自负责）',
+      loan2.loan.custodian.id === zhouId && loan2.loan.items[0].outstanding === 1);
+    // 库存 2 已全部在外（林晚1+周海1）：再领 1 件 -> OVER_STOCK
+    const overStock = await J('/api/prop-loans', director,
+      { requestNo: 'LO-4', scheduleId: l2.id, custodianActorId: zhouId,
+        items: [{ propId: propAdj, quantity: 1 }, { propId: propLoanX, quantity: 1 }] }, 409);
+    check('混合批次中一项超库存 -> 整次不生效（另一道具也不领用）',
+      overStock.error === 'PROP_LOAN_REJECTED'
+        && overStock.details.items.some((x) => x.code === 'OVER_STOCK' && x.propId === propLoanX
+          && x.outstandingAcrossSlots === 2 && x.available === 0),
+      JSON.stringify(overStock.details));
+    // 失败后另一道具（待调整道具）未被领用
+    const afterFail = await G('/api/prop-loans', director);
+    check('整次失败不写任何领用单',
+      afterFail.loans.every((ln) => ln.id !== undefined)
+        && !afterFail.loans.some((ln) => ln.requestNo === 'LO-4'), JSON.stringify(afterFail.loans.map((x) => x.requestNo)));
+
+    console.log('— 实物归还：分批登记 / 损坏扣库存 / 超量拒绝 —');
+    const itemOf = (loanResp) => loanResp.loan.items.find((i) => i.propId === propLoanX);
+    // 林晚先归还完好 1（其 outstanding 1）
+    const ret1 = await J(`/api/prop-loans/${loan1.loan.id}/returns`, director,
+      { note: '完好', items: [{ loanItemId: itemOf(loan1).id, good: 1, damaged: 0 }] }, 201);
+    check('完好归还：未归还清零，库存不扣减',
+      ret1.stockAfter.length === 0 && itemOf(ret1).returnedGood === 1 && itemOf(ret1).outstanding === 0);
+    // 超未归还量再还 -> 409
+    const retOver = await J(`/api/prop-loans/${loan1.loan.id}/returns`, director,
+      { items: [{ loanItemId: itemOf(loan1).id, good: 1 }] }, 409);
+    check('合计超过未归还量 -> 409 OVER_OUTSTANDING 整批不生效',
+      retOver.error === 'PROP_RETURN_REJECTED'
+        && retOver.details.items[0].code === 'OVER_OUTSTANDING'
+        && retOver.details.items[0].outstanding === 0, JSON.stringify(retOver.details));
+    // 不存在的明细 / 不属于该单 -> 409
+    await J(`/api/prop-loans/${loan1.loan.id}/returns`, director,
+      { items: [{ loanItemId: 99999, good: 1 }] }, 409);
+    await J(`/api/prop-loans/${loan2.loan.id}/returns`, director,
+      { items: [{ loanItemId: itemOf(loan1).id, good: 1 }] }, 409);
+    // 全 0 / 空批次 -> 400
+    await J(`/api/prop-loans/${loan2.loan.id}/returns`, director,
+      { items: [{ loanItemId: itemOf(loan2).id, good: 0, damaged: 0 }] }, 400);
+    await J(`/api/prop-loans/${loan2.loan.id}/returns`, director, { items: [] }, 400);
+    check('全0件/空批次/跨单明细均拒绝', true);
+    // 周海归还损坏 1 -> 库存 2->1；响应给缺口（此时 L1 已取消？否，预约峰值仍 1<=1 无缺口）
+    const retDmg = await J(`/api/prop-loans/${loan2.loan.id}/returns`, director,
+      { note: '摔裂', items: [{ loanItemId: itemOf(loan2).id, good: 0, damaged: 1 }] }, 201);
+    check('损坏归还：累计损坏、未归还清零；库存扣减 1',
+      itemOf(retDmg).returnedDamaged === 1 && itemOf(retDmg).outstanding === 0
+        && retDmg.stockAfter[0].totalCount === 1 && retDmg.stockAfter[0].damagedDeducted === 1
+        && retDmg.reservationShortages.length === 0, JSON.stringify(retDmg.stockAfter));
+    const ledgerProp = (await G('/api/props', director)).props.find((p) => p.id === propLoanX);
+    check('登记册反映扣减后库存与未归还量',
+      ledgerProp.totalCount === 1 && ledgerProp.outstandingLoans === 0, JSON.stringify(ledgerProp));
+
+    console.log('— 损坏扣库存：既有预约保留并显示缺口，后续预约/调期按新库存 —');
+    // 再领一件制造未归还，然后损坏扣到 0：新道具方式更直接——
+    // L1 此前领用已还清（毛领用1）。预约仍为 1。先再领用会撞“毛领用>预约1”，故改为：
+    // 让导演人工把库存从 1 下调会被严格拒绝（峰值1，下调到0）；直接构造损坏：周海 L2 已无未归还。
+    // 改为对“待调整道具 propAdj（库存1）”走一遍：L2 预约 propAdj 1 后领用再损坏归还。
+    await req('PUT', `/api/rehearsals/${rhY}/schedules/${l2.id}/props`, director,
+      { items: [{ propId: propAdj, quantity: 1 }] }, 200);
+    const loanAdj = await J('/api/prop-loans', director,
+      { requestNo: 'LO-ADJ', scheduleId: l2.id, custodianActorId: zhouId, items: [{ propId: propAdj, quantity: 1 }] }, 201);
+    const adjItem = loanAdj.loan.items[0];
+    const retAdj = await J(`/api/prop-loans/${loanAdj.loan.id}/returns`, director,
+      { items: [{ loanItemId: adjItem.id, damaged: 1 }] }, 201);
+    // propAdj 库存 1->0；其有效预约峰值含 spPW（端点相接已移开？spPW 在 09:00-10:00；spZ 10:00-11:00 sc1）
+    check('损坏使库存归 0 且既有有效预约超量：响应返回缺口、预约保留',
+      retAdj.stockAfter[0].totalCount === 0
+        && retAdj.reservationShortages.some((s) => s.propId === propAdj && s.shortage >= 1),
+      JSON.stringify(retAdj.reservationShortages));
+    const shortageList = await G('/api/props/shortages', director);
+    check('导演库存缺口视图列出超量道具（缺口数/库存/峰值，时段取最早峰值时刻）',
+      shortageList.shortages.some((s) => s.propId === propAdj && s.totalCount === 0
+        && s.shortage === 1 && s.peakReserved === 1), JSON.stringify(shortageList.shortages));
+    // 后续预约：把 L2 的 propAdj 由 1 加到 2（峰值抬高）-> 按新库存拒绝
+    const bumpFail = await req('PUT', `/api/rehearsals/${rhY}/schedules/${l2.id}/props`, director,
+      { items: [{ propId: propAdj, quantity: 2 }] }, 409);
+    check('缺口保留后，新预约抬高峰值仍按新库存 409',
+      bumpFail.error === 'PROP_CAPACITY_CONFLICT' && bumpFail.details.shortages[0].propId === propAdj);
+    // 同值重提（仍 1，未扩大缺口）-> 成功（保留预约与缺口）
+    const keepSame = await req('PUT', `/api/rehearsals/${rhY}/schedules/${l2.id}/props`, director,
+      { items: [{ propId: propAdj, quantity: 1 }] }, 200);
+    check('不扩大缺口的同值预约允许（既有预约保留）', keepSame.ok === true);
+    // 手动下调仍严格：propAdj 已 0，无操作；领用道具（库存1，峰值1）下调到 0 -> 409
+    await req('PATCH', `/api/props/${propLoanX}`, director, { totalCount: 0 }, 409);
+    check('人工下调库存仍按既有有效预约严格拒绝', true);
+
+    console.log('— 领用责任清单 / 取消不抹除流水与责任 —');
+    // 制造一个未归还：L2 对领用道具已有 1 次历史毛领用（预约1，不能再领）；
+    // 另开一个不重叠时段 L3（周海）预约 1 件后领用、不归还
+    const l3 = (await J(`/api/rehearsals/${rhY}/schedules`, director,
+      { sceneId: sc1, startAt: '2036-01-11T10:00:00Z', endAt: '2036-01-11T11:00:00Z' }, 201)).schedule;
+    await req('PUT', `/api/rehearsals/${rhY}/schedules/${l3.id}/props`, director,
+      { items: [{ propId: propLoanX, quantity: 1 }] }, 200);
+    const loanOpen = await J('/api/prop-loans', director,
+      { requestNo: 'LO-OPEN', scheduleId: l3.id, custodianActorId: zhouId, items: [{ propId: propLoanX, quantity: 1 }] }, 201);
+    const resp = await G('/api/prop-loans/responsibilities', director);
+    check('责任清单仅列未归还明细并按保管人归并（周海名下 1 件）',
+      resp.totalOutstandingItems >= 1
+        && resp.custodians.some((c) => c.custodian.id === zhouId
+          && c.items.some((it) => it.loanId === loanOpen.loan.id && it.outstanding === 1)),
+      JSON.stringify(resp.custodians.map((c) => [c.custodian.username, c.items.length])));
+    // 取消 L3：流水与周海责任保留，仍可按原单归还
+    await J(`/api/rehearsals/${rhY}/schedules/${l3.id}/cancel`, director, {}, 200);
+    const loanAfterCancel = await G(`/api/prop-loans/${loanOpen.loan.id}`, director);
+    check('取消后领用流水仍在（时段标 cancelled，明细未归还量不变）',
+      loanAfterCancel.loan.schedule.status === 'cancelled'
+        && loanAfterCancel.loan.items[0].outstanding === 1
+        && loanAfterCancel.loan.custodian.id === zhouId,
+      JSON.stringify(loanAfterCancel.loan.schedule.status));
+    // 已取消时段不能新领用
+    await J('/api/prop-loans', director,
+      { requestNo: 'LO-AFTER-CANCEL', scheduleId: l3.id, custodianActorId: zhouId, items: [{ propId: propLoanX, quantity: 1 }] }, 400);
+    // 仍可按原领用单归还（完好）
+    const retAfterCancel = await J(`/api/prop-loans/${loanOpen.loan.id}/returns`, director,
+      { items: [{ loanItemId: loanOpen.loan.items[0].id, good: 1 }] }, 201);
+    check('取消后仍按原领用记录归还，责任解除', retAfterCancel.loan.items[0].outstanding === 0);
+    const resp2 = await G('/api/prop-loans/responsibilities', director);
+    check('归还后责任清单不再含该明细',
+      !resp2.custodians.some((c) => c.items.some((it) => it.loanId === loanOpen.loan.id)));
+
+    console.log('— 实物领用：演员仅见本人领还流水 / 越权隔离 —');
+    const myLin = await G('/api/me/prop-loans', lin);
+    check('林晚只见本人作为保管人的领用单（含 LO-1，不含周海单据）',
+      myLin.loans.length >= 1 && myLin.loans.every((ln) => ln.custodian.id === linId)
+        && myLin.loans.some((ln) => ln.id === loan1.loan.id)
+        && !myLin.loans.some((ln) => ln.id === loan2.loan.id), JSON.stringify(myLin.loans.map((x) => x.id)));
+    await G('/api/prop-loans', null, 401);
+    await G(`/api/prop-loans/${loan2.loan.id}`, lin, 403);
+    await G('/api/prop-loans/responsibilities', zhou, 403);
+    const linList = await G('/api/prop-loans', lin);
+    check('演员列表也仅本人单据；未登录401；非保管人403；责任清单演员403',
+      linList.loans.every((ln) => ln.custodian.id === linId));
+    // 导演可按时段/保管人过滤
+    const bySched = await G(`/api/prop-loans?scheduleId=${l1.id}`, director);
+    check('导演可按时段过滤领用单', bySched.loans.every((ln) => ln.schedule.id === l1.id)
+      && bySched.loans.some((ln) => ln.id === loan1.loan.id));
+    // 流水含逐批归还记录
+    const withReturns = await G(`/api/prop-loans/${loan2.loan.id}`, director);
+    check('领用单详情含分批归还流水（含损坏批次）',
+      withReturns.loan.returns.length >= 1
+        && withReturns.loan.returns[0].items.some((it) => it.damaged === 1),
+      JSON.stringify(withReturns.loan.returns));
+  }
+
   console.log('— 临时替角：设置 / 替换 / 撤回与最终参与者、通知 —');
   {
     // 新剧 v1：场景 tS1 有 roleT(甲) 与 roleU(乙) 台词，场景 tS2 只有 roleT 台词

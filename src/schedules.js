@@ -2,7 +2,7 @@ const express = require('express');
 const { db, transaction } = require('./db');
 const { badRequest, notFound, forbidden, conflict, wrap } = require('./errors');
 const { authRequired } = require('./auth');
-const { assertPropsAfterScheduleChange } = require('./props');
+const { assertPropsAfterScheduleChange, peakSnapshotAll } = require('./props');
 const { settlementMarkForSession } = require('./settlements');
 
 /**
@@ -879,6 +879,8 @@ router.patch(
     const s = getScheduleOrThrow(req.params.scheduleId, r.id);
     if (s.status === 'cancelled') throw badRequest('已取消的安排不能调整，请重新创建');
     const { sceneId, startAt, endAt } = validateSceneAndTimes(r, req.body, s);
+    // 调期前预约峰值快照（须在任何 UPDATE 之前）：只禁止把某道具峰值抬高到库存以上
+    const prePeaks = peakSnapshotAll();
     transaction(() => {
       db.prepare(
         "UPDATE rehearsal_schedules SET scene_id = ?, start_at = ?, end_at = ?, status = 'active' WHERE id = ?"
@@ -891,7 +893,7 @@ router.patch(
       assertNoScheduleConflicts([cand]);
       assertNoUnavailabilityConflicts([cand], '参与演员在该时段已登记不可用，本次调整未生效');
       // 既有道具预约随时段移动：按最终状态重算库存（待调整恢复有效时同样在此重新校验占用）
-      assertPropsAfterScheduleChange();
+      assertPropsAfterScheduleChange(prePeaks);
       // 起止/场次实质变化（或待调整恢复有效）-> 生成新通知批次；无实质变化不重复生成
       syncScheduleNotifications(r.id, 'adjust', req.user.id);
     });
@@ -946,6 +948,9 @@ router.post(
     });
 
     const result = transaction(() => {
+      // 调期前预约峰值快照（在任何 UPDATE 之前）：损坏扣库存造成的既有缺口允许随移动保留，
+      // 只拒绝把某道具峰值抬高到库存以上的调期
+      const prePeaks = peakSnapshotAll();
       // 先按目标值整批落库（仍在同一事务内：后续抛错即整体回滚，整批不生效）
       for (const x of parsed) {
         db.prepare(
@@ -964,7 +969,7 @@ router.post(
         '批量调整后参与演员在该时段已登记不可用，本次整批调整未生效'
       );
       // 道具预约随时段整体移动：整批最终时间下任一道具时刻超库存 -> 整批不生效（回滚上面的 UPDATE）
-      assertPropsAfterScheduleChange();
+      assertPropsAfterScheduleChange(prePeaks);
       // 仅实质变化（指纹不同，含待调整恢复有效）的时段生成新批次；未变化的不重发
       const created = syncScheduleNotifications(r.id, 'batch_adjust', req.user.id);
       return { created: new Map(created.map((x) => [x.scheduleId, x])) };

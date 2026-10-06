@@ -146,42 +146,115 @@ function peakOverlap(rows) {
 }
 
 /**
- * 按数据库中的“最终状态”校验全部道具库存容量（调用方须先把预约/调期在事务内落库）。
- *   - overrides: Map<propId, totalCount> 可临时覆盖库存（下调库存校验时用）。
- * 任一道具峰值占用超过库存 -> 抛 409 PROP_CAPACITY_CONFLICT（details.shortages），整批不生效。
+ * 按数据库中的“最终状态”计算全部（或指定）道具相对库存的预约缺口（不抛错）。
+ *   - propIds: 仅检查这些道具（null = 全部道具）；
+ *   - overrides: Map<propId, totalCount> 临时覆盖库存（手动下调校验时用）。
+ * 返回 shortage 详情数组（结构同 409 details.shortages）；空数组 = 无缺口。
+ *
+ * 注意：库存可能因道具“损坏件扣减库存”而低于既有有效预约峰值——此时缺口是被允许的
+ * （保留预约并显示缺口）；本函数只负责计算，是否拒绝由 assert* 按“不得扩大缺口”判定。
  */
-function assertPropCapacity({ overrides = null, message = '共享道具库存不足，本次操作未生效' } = {}) {
-  const props = db.prepare('SELECT * FROM props ORDER BY id').all();
+function computePropShortages({ propIds = null, overrides = null } = {}) {
+  const props = propIds
+    ? propIds.map((id) => db.prepare('SELECT * FROM props WHERE id = ?').get(id)).filter(Boolean)
+    : db.prepare('SELECT * FROM props ORDER BY id').all();
   const shortages = [];
   for (const prop of props) {
     const total = overrides?.has(prop.id) ? overrides.get(prop.id) : prop.total_count;
-    const rows = activeReservationsForProp(prop.id);
-    const peak = peakOverlap(rows);
-    if (peak.at != null && peak.peak > total) {
-      shortages.push({
-        propId: prop.id,
-        propName: prop.name,
-        totalCount: total,
-        peakAt: new Date(peak.at).toISOString(),
-        shortage: peak.peak - total,
-        peakReserved: peak.peak,
-        schedules: peak.rows.map((row) => ({
-          id: row.schedule_id,
-          rehearsalId: row.rehearsal_id,
-          rehearsalName: row.rehearsal_name,
-          sceneId: row.scene_id,
-          sceneTitle: (() => {
-            const scene = db.prepare('SELECT code, title FROM scenes WHERE id = ?').get(row.scene_id);
-            return scene ? `${scene.code} ${scene.title}` : null;
-          })(),
-          startAt: row.start_at,
-          endAt: row.end_at,
-          quantity: row.quantity,
-        })),
-      });
-    }
+    const detail = reservationShortageDetail(prop.id, total);
+    if (detail) shortages.push(detail);
+  }
+  return shortages;
+}
+
+/** 单道具预约缺口详情（峰值占用 > 给定库存时返回，否则 null）。 */
+function reservationShortageDetail(propId, totalOverride = null) {
+  const prop = db.prepare('SELECT * FROM props WHERE id = ?').get(propId);
+  if (!prop) return null;
+  const total = totalOverride == null ? prop.total_count : totalOverride;
+  const rows = activeReservationsForProp(prop.id);
+  const peak = peakOverlap(rows);
+  if (!(peak.at != null && peak.peak > total)) return null;
+  return {
+    propId: prop.id,
+    propName: prop.name,
+    totalCount: total,
+    peakAt: new Date(peak.at).toISOString(),
+    shortage: peak.peak - total,
+    peakReserved: peak.peak,
+    schedules: peak.rows.map((row) => ({
+      id: row.schedule_id,
+      rehearsalId: row.rehearsal_id,
+      rehearsalName: row.rehearsal_name,
+      sceneId: row.scene_id,
+      sceneTitle: (() => {
+        const scene = db.prepare('SELECT code, title FROM scenes WHERE id = ?').get(row.scene_id);
+        return scene ? `${scene.code} ${scene.title}` : null;
+      })(),
+      startAt: row.start_at,
+      endAt: row.end_at,
+      quantity: row.quantity,
+    })),
+  };
+}
+
+/**
+ * 预约写入（单条/批量）后的库存校验（调用方须先把预约落库）：
+ *   - propIds: 本次涉及的道具；prePeaks: Map<propId, 写入前峰值>；
+ *   - 仅当某道具“写入后峰值高于写入前峰值”且超过库存时才拒绝——损坏扣库存造成的
+ *     既有缺口（峰值未被本次操作抬高）保留并允许，只禁止把缺口进一步拉大。
+ * 任一道具被拉大缺口 -> 抛 409 PROP_CAPACITY_CONFLICT，整批不生效。
+ */
+function assertReservationsWithinStock(propIds, prePeaks, message = '共享道具库存不足，本次操作未生效') {
+  const shortages = [];
+  for (const propId of propIds) {
+    const prop = db.prepare('SELECT * FROM props WHERE id = ?').get(propId);
+    if (!prop) continue;
+    const detail = reservationShortageDetail(prop.id);
+    if (!detail) continue;
+    const prePeak = prePeaks.get(prop.id) ?? 0;
+    if (detail.peakReserved > prePeak) shortages.push(detail);
   }
   if (shortages.length) throw conflict('PROP_CAPACITY_CONFLICT', message, { shortages });
+}
+
+/**
+ * 调期/批量调期/待调整恢复有效后校验道具库存（须在源操作事务内调用，抛错即整体回滚）。
+ * 预约随时段移动：预约行本身不动，只是其 JOIN 的时段时间已更新。
+ * prePeaks: Map<propId, 调期前峰值>——与预约写入同口径，只禁止把某道具的峰值占用
+ * 抬高到库存以上；损坏扣库存造成的既有缺口不因“移动但未抬高”而拒绝。
+ */
+function assertPropsAfterScheduleChange(prePeaks = null, message = '调期后共享道具库存不足（既有预约随时段移动），本次日程操作整体不生效') {
+  if (!prePeaks) {
+    // 无基线时退化为严格校验（兼容旧调用）
+    const shortages = computePropShortages();
+    if (shortages.length) throw conflict('PROP_CAPACITY_CONFLICT', message, { shortages });
+    return;
+  }
+  const shortages = [];
+  for (const [propId, prePeak] of prePeaks) {
+    const detail = reservationShortageDetail(propId);
+    if (detail && detail.peakReserved > prePeak) shortages.push(detail);
+  }
+  if (shortages.length) throw conflict('PROP_CAPACITY_CONFLICT', message, { shortages });
+}
+
+/** 写入前快照：给定道具集合当前的峰值占用 Map<propId, peak>。 */
+function peakSnapshot(propIds) {
+  const map = new Map();
+  for (const propId of propIds) {
+    map.set(propId, peakOverlap(activeReservationsForProp(propId)).peak);
+  }
+  return map;
+}
+
+/** 全部道具当前的预约峰值快照（调期可能影响任一道具）。 */
+function peakSnapshotAll() {
+  const map = new Map();
+  for (const prop of db.prepare('SELECT id FROM props ORDER BY id').all()) {
+    map.set(prop.id, peakOverlap(activeReservationsForProp(prop.id)).peak);
+  }
+  return map;
 }
 
 /**
@@ -270,6 +343,15 @@ function serializeProp(p) {
         WHERE pr.prop_id = ? AND s.status = 'active' AND pr.quantity > 0`
     )
     .get(p.id).n;
+  // 跨时段未归还实物量（含已取消/待调整时段：责任不因时段状态而抹除）
+  const outstanding = db
+    .prepare(
+      `SELECT COALESCE(SUM(pli.quantity - pli.returned_good - pli.returned_damaged), 0) AS n
+         FROM prop_loan_items pli
+        WHERE pli.prop_id = ?`
+    )
+    .get(p.id).n;
+  const shortage = Math.max(0, peakRow.peak - p.total_count);
   return {
     id: p.id,
     name: p.name,
@@ -277,6 +359,11 @@ function serializeProp(p) {
     activeReservationCount: reservationCount,
     peakReserved: peakRow.peak,
     availableNow: p.total_count - peakRow.peak,
+    // 损坏扣库存后既有有效预约可能超量：保留预约并显示缺口（0 = 无缺口）
+    reservationShortage: shortage,
+    // 当前在外面（未归还）的实物件数与仍可领用的净库存
+    outstandingLoans: outstanding,
+    onHand: p.total_count - outstanding,
     createdAt: p.created_at,
   };
 }
@@ -334,11 +421,16 @@ router.patch(
     }
     if (!fields.length) throw badRequest('至少提供一个待更新字段：name 或 totalCount');
 
-    // 下调库存（或任何调整）：仅有效预约占用；任一时刻不足整次不生效，库存保持原值
-    assertPropCapacity({
-      overrides: new Map([[prop.id, nextTotal]]),
-      message: '下调后道具库存不足以覆盖现有有效预约，本次调整未生效',
-    });
+    // 手动下调库存（改名不校验）：目标库存须覆盖当前有效预约峰值；不足整次不生效，库存保持原值。
+    // 注意：损坏件扣库存造成的既有缺口由归还流程维护，这里的人工下调仍按严格口径拒绝。
+    if (req.body?.totalCount !== undefined && nextTotal < prop.total_count) {
+      const detail = reservationShortageDetail(prop.id, nextTotal);
+      if (detail) {
+        throw conflict('PROP_CAPACITY_CONFLICT', '下调后道具库存不足以覆盖现有有效预约，本次调整未生效', {
+          shortages: [detail],
+        });
+      }
+    }
     params.push(prop.id);
     db.prepare(`UPDATE props SET ${fields.join(', ')} WHERE id = ?`).run(...params);
     res.json({ ok: true, prop: serializeProp(db.prepare('SELECT * FROM props WHERE id = ?').get(prop.id)) });
@@ -377,12 +469,15 @@ router.put(
       parsed.push({ propId, quantity });
     });
 
+    // 仅对本时段涉及的道具做写入前峰值快照，写入后只拒绝“把峰值抬高到库存以上”
+    const touchedPropIds = parsed.map((x) => x.propId);
+    const prePeaks = peakSnapshot(touchedPropIds);
     transaction(() => {
       applyReservations(s.id, parsed, req.user.id);
       // 待调整时段不占用库存，无需容量校验；有效时段按最终状态整体校验
       const row = db.prepare('SELECT * FROM rehearsal_schedules WHERE id = ?').get(s.id);
       if (row.status === 'active') {
-        assertPropCapacity({ message: '道具预约后库存不足，本次操作未生效' });
+        assertReservationsWithinStock(touchedPropIds, prePeaks, '道具预约后库存不足，本次操作未生效');
       }
     });
     res.json({ ok: true, ...slotPropView(db.prepare('SELECT * FROM rehearsal_schedules WHERE id = ?').get(s.id)) });
@@ -429,12 +524,15 @@ router.post(
       if (!bySchedule.has(x.scheduleId)) bySchedule.set(x.scheduleId, []);
       bySchedule.get(x.scheduleId).push({ propId: x.propId, quantity: x.quantity });
     }
+    const touchedPropIds = [...new Set(parsed.map((x) => x.propId))];
+    const prePeaks = peakSnapshot(touchedPropIds);
     transaction(() => {
       for (const [scheduleId, list] of bySchedule) {
         applyReservations(scheduleId, list, req.user.id);
       }
-      // 整批最终状态：任一有效时刻占用超过库存 -> 整批不生效（上面的写入随事务回滚）
-      assertPropCapacity({ message: '批量预约后道具库存不足，本次整批操作未生效' });
+      // 整批最终状态：把某道具峰值抬高到库存以上 -> 整批不生效（上面的写入随事务回滚）；
+      // 损坏扣库存造成的既有缺口允许保留，不因同批未抬高缺口的道具而整体失败
+      assertReservationsWithinStock(touchedPropIds, prePeaks, '批量预约后道具库存不足，本次整批操作未生效');
     });
 
     const results = [...bySchedule.keys()]
@@ -488,19 +586,21 @@ router.get(
 );
 
 // ---- 调度集成（供 schedules.js 在事务内调用） ----
-
-/**
- * 调期/批量调期/待调整恢复有效后校验道具库存（须在源操作事务内调用，抛错即整体回滚）。
- * 预约随时段移动：预约行本身不动，只是其 JOIN 的时段时间已更新，这里按最终状态重算。
- */
-function assertPropsAfterScheduleChange() {
-  assertPropCapacity({ message: '调期后共享道具库存不足（既有预约随时段移动），本次日程操作整体不生效' });
-}
+// assertPropsAfterScheduleChange / peakSnapshotAll 已在上方与缺口计算一并定义。
 
 module.exports = {
   router,
-  assertPropCapacity,
+  assertPropCapacity: ({ overrides = null, message = '共享道具库存不足，本次操作未生效' } = {}) => {
+    // 兼容旧调用方：严格口径（忽略损坏缺口豁免），当前仅测试/外部可能引用
+    const shortages = computePropShortages({ overrides });
+    if (shortages.length) throw conflict('PROP_CAPACITY_CONFLICT', message, { shortages });
+  },
+  assertReservationsWithinStock,
   assertPropsAfterScheduleChange,
+  computePropShortages,
+  reservationShortageDetail,
+  peakSnapshot,
+  peakSnapshotAll,
   slotPropView,
   slotPropViewForActor,
   isScheduleParticipant,
